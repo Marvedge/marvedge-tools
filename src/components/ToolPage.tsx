@@ -4,7 +4,7 @@ import Link from "next/link";
 import { ArrowLeft, ArrowUpRight, Check, ShieldCheck } from "lucide-react";
 import { getTool, MARVEDGE_URL, type Tool } from "@/lib/tools";
 import { getToolSeo } from "@/lib/tool-seo";
-import { Mp4ToGif } from "@/components/tools/VideoTools";
+import { ToolWorkspace } from "@/components/tools/registry";
 import { ToolEditorialSections } from "./ToolSections";
 import { ToolFaqSection } from "./ToolFaq";
 
@@ -41,7 +41,7 @@ export function ToolPage({ tool }: { tool: Tool }) {
 
         {/* ACTUAL INTERACTIVE TOOL WORKSPACE */}
         <div className="rounded-3xl border border-[#D6CCB5] bg-[#FFFFFF] p-6 shadow-sm sm:p-8">
-          <Mp4ToGif />
+          <ToolWorkspace slug={tool.slug} />
         </div>
 
         {/* DIRECT ANSWER SUMMARY & TRUST CHIPS (TAPLIO-STYLE) */}
