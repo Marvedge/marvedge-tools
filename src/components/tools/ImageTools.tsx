@@ -13,6 +13,13 @@ import { cornerRadii, drawModule, drawQr, type QrCorner, type QrFrame, type QrSh
 import { QrPrintLayout } from "./QrPrinter";
 import { QrCollage } from "./QrCollage";
 import { Btn, Dropzone, DownloadBtn, ErrorNote, Field, Panel, baseName, canvasBlob, download, extFor, fmtBytes, inputCls, loadImage, rangeCls } from "./ui";
+import {
+  decodeImage,
+  correctImageOrientation,
+  canvasToBlob,
+  downloadBlob,
+  type SupportedCanvasOutputType,
+} from "@/lib/image";
 
 type Out = { name: string; before: number; blob: Blob; url: string };
 
@@ -28,14 +35,23 @@ export function ImageCompressor() {
     setBusy(true);
     const res: Out[] = [];
     for (const f of files) {
-      const img = await loadImage(f);
-      const c = document.createElement("canvas");
-      c.width = img.naturalWidth; c.height = img.naturalHeight;
-      const ctx = c.getContext("2d")!;
-      if (format === "image/jpeg") { ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height); }
-      ctx.drawImage(img, 0, 0);
-      const blob = await canvasBlob(c, format, quality / 100);
-      res.push({ name: `${baseName(f.name)}-compressed.${extFor(format)}`, before: f.size, blob, url: URL.createObjectURL(blob) });
+      const bitmap = await decodeImage(f);
+      try {
+        const orientedCanvas = correctImageOrientation(bitmap);
+        const blob = await canvasToBlob(orientedCanvas, {
+          type: format as SupportedCanvasOutputType,
+          quality: quality / 100,
+          backgroundColor: format === "image/jpeg" ? "#ffffff" : null,
+        });
+        res.push({
+          name: `${baseName(f.name)}-compressed.${extFor(format)}`,
+          before: f.size,
+          blob,
+          url: URL.createObjectURL(blob),
+        });
+      } finally {
+        bitmap.close();
+      }
     }
     setOut(res); setBusy(false);
   };
@@ -70,7 +86,7 @@ export function ImageCompressor() {
                     {fmtBytes(o.before)} → <b className="text-[#000000]">{fmtBytes(o.blob.size)}</b> ({Math.round((1 - o.blob.size / o.before) * 100)}% smaller)
                   </p>
                 </div>
-                <DownloadBtn onClick={() => download(o.blob, o.name)} />
+                <DownloadBtn onClick={() => downloadBlob(o.blob, o.name)} />
               </div>
             ))}
           </div>
@@ -83,7 +99,7 @@ export function ImageCompressor() {
 /* ---------- Image Resizer ---------- */
 export function ImageResizer() {
 
-  const [img, setImg] = useState<HTMLImageElement | null>(null);
+  const [img, setImg] = useState<HTMLCanvasElement | null>(null);
   const [name, setName] = useState("image");
   const [w, setW] = useState(0); const [h, setH] = useState(0);
   const [lock, setLock] = useState(true);
@@ -92,7 +108,7 @@ export function ImageResizer() {
   const [kb, setKb] = useState<number | "">("");
   const [out, setOut] = useState<{ blob: Blob; url: string; q: number; scale: number; hits: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
-  const ratio = img ? img.naturalWidth / img.naturalHeight : 1;
+  const ratio = img ? img.width / img.height : 1;
   const target = kb ? Math.max(1, Math.round(kb * 1024)) : 0;
 
   const draw = (scale = 1) => {
@@ -102,8 +118,8 @@ export function ImageResizer() {
     const ctx = c.getContext("2d")!; ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, H);
     if (fit === "stretch") ctx.drawImage(img, 0, 0, W, H);
     else {
-      const s = fit === "cover" ? Math.max(W / img.naturalWidth, H / img.naturalHeight) : Math.min(W / img.naturalWidth, H / img.naturalHeight);
-      const dw = img.naturalWidth * s, dh = img.naturalHeight * s;
+      const s = fit === "cover" ? Math.max(W / img.width, H / img.height) : Math.min(W / img.width, H / img.height);
+      const dw = img.width * s, dh = img.height * s;
       ctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
     }
     return c;
@@ -113,12 +129,19 @@ export function ImageResizer() {
   const make = async () => {
     const base = draw(); if (!base) return null;
     const mk = (blob: Blob, q: number, scale: number, hits: boolean) => ({ blob, url: URL.createObjectURL(blob), q, scale, hits });
-    if (!target) return mk(await canvasBlob(base, "image/jpeg", 0.92), 0.92, 1, true);
+    if (!target) return mk(await canvasToBlob(base, { type: "image/jpeg", quality: 0.92, backgroundColor: "#ffffff" }), 0.92, 1, true);
     const cache = new Map<string, Blob>();
     const encode = async (q: number, scale: number) => {
       const key = `${q}|${scale}`;
       let blob = cache.get(key);
-      if (!blob) { blob = await canvasBlob(scale === 1 ? base : draw(scale)!, "image/jpeg", q); cache.set(key, blob); }
+      if (!blob) {
+        blob = await canvasToBlob(scale === 1 ? base : draw(scale)!, {
+          type: "image/jpeg",
+          quality: q,
+          backgroundColor: "#ffffff",
+        });
+        cache.set(key, blob);
+      }
       return { size: blob.size, blob };
     };
     const fit = await fitToTarget(encode, target);
@@ -140,7 +163,18 @@ export function ImageResizer() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [img, w, h, fit, kb]);
 
-  const pick = async (f: File) => { const i = await loadImage(f); setImg(i); setName(baseName(f.name)); setW(i.naturalWidth); setH(i.naturalHeight); };
+  const pick = async (f: File) => {
+    const bitmap = await decodeImage(f);
+    try {
+      const orientedCanvas = correctImageOrientation(bitmap);
+      setImg(orientedCanvas);
+      setName(baseName(f.name));
+      setW(orientedCanvas.width);
+      setH(orientedCanvas.height);
+    } finally {
+      bitmap.close();
+    }
+  };
   return (
     <Panel>
       {!img ? (
@@ -225,7 +259,7 @@ export function ImageResizer() {
               </div>
             </Field>
             <div className="flex flex-wrap gap-2">
-              <DownloadBtn onClick={() => out && download(out.blob, `${name}-${w}x${h}.jpg`)}>Download {out ? fmtBytes(out.blob.size) : ""}</DownloadBtn>
+              <DownloadBtn onClick={() => out && downloadBlob(out.blob, `${name}-${w}x${h}.jpg`)}>Download {out ? fmtBytes(out.blob.size) : ""}</DownloadBtn>
               <Btn variant="ghost" onClick={() => setImg(null)}>New image</Btn>
             </div>
           </div>
@@ -247,17 +281,26 @@ export function FormatConverter() {
   const run = async () => {
     setBusy(true); const res: Out[] = [];
     for (const f of files) {
-      const img = await loadImage(f);
-      const c = document.createElement("canvas"); c.width = img.naturalWidth; c.height = img.naturalHeight;
-      const ctx = c.getContext("2d")!;
-      if (to === "image/jpeg") { ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height); }
-      ctx.drawImage(img, 0, 0);
-      const blob = await canvasBlob(c, to, 0.92);
-      res.push({ name: `${baseName(f.name)}.${extFor(to)}`, before: f.size, blob, url: URL.createObjectURL(blob) });
+      const bitmap = await decodeImage(f);
+      try {
+        const orientedCanvas = correctImageOrientation(bitmap);
+        const blob = await canvasToBlob(orientedCanvas, {
+          type: to as SupportedCanvasOutputType,
+          quality: 0.92,
+          backgroundColor: to === "image/jpeg" ? "#ffffff" : null,
+        });
+        res.push({ name: `${baseName(f.name)}.${extFor(to)}`, before: f.size, blob, url: URL.createObjectURL(blob) });
+      } finally {
+        bitmap.close();
+      }
     }
     setOut(res); setBusy(false);
   };
-  const zip = async () => { const z = new JSZip(); out.forEach((o) => z.file(o.name, o.blob)); download(await z.generateAsync({ type: "blob" }), "converted-images.zip"); };
+  const zip = async () => {
+    const z = new JSZip();
+    out.forEach((o) => z.file(o.name, o.blob));
+    downloadBlob(await z.generateAsync({ type: "blob" }), "converted-images.zip");
+  };
   return (
     <Panel>
       <Dropzone accept="image/*" multiple label="Drop images to convert" onFiles={(f) => { setFiles(f); setOut([]); }}
@@ -294,7 +337,7 @@ export function FormatConverter() {
               <img src={o.url} alt="" width={48} height={48} className="h-12 w-12 shrink-0 rounded-lg border border-[#D6CCB5] bg-[#FFFFFF] object-cover" />
               <span className="min-w-0 flex-1 truncate font-semibold text-[#000000]">{o.name}</span>
               <span className="tabular-nums text-[#4A4740]">{fmtBytes(o.blob.size)}</span>
-              <DownloadBtn onClick={() => download(o.blob, o.name)}>Save</DownloadBtn>
+              <DownloadBtn onClick={() => downloadBlob(o.blob, o.name)}>Save</DownloadBtn>
             </div>
           ))}
           {out.length > 1 && <div><DownloadBtn onClick={zip}>Download all as ZIP</DownloadBtn></div>}
