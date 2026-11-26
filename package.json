@@ -8,9 +8,12 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
+    "test:links": "vitest run --config vitest.node.config.ts",
+    "test:links:watch": "vitest --config vitest.node.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.119.2",
     "gifenc": "^1.0.3",
     "gifuct-js": "^2.1.2",
     "jszip": "^3.10.2",
@@ -19,7 +22,9 @@
     "pdf-lib": "^1.17.1",
     "qrcode": "^1.5.4",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "server-only": "^0.0.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "4.3.3",
