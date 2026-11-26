@@ -1,264 +1,465 @@
-# Link Shortener — Verification Checklist
+# Link Shortener Verification Guide (Backend & Admin API)
 
-**Branch:** `feat/t-00034-link-shortener-backend` (backend) / `feat/t-00035-link-shortener-frontend` (frontend)
-**Last updated:** 2026-11-26
+This guide documents automated test verification, manual `curl.exe -i` procedures to validate the HTTP 302 redirect route (`app/go/[code]/route.ts`), status codes, response headers, security controls, and the administrative moderation API (`/api/admin/links/*`).
 
-This document records the manual and automated verification steps required before merging the Link Shortener PRs.
-
----
-
-## 1. Environment Setup
-
-```bash
-# Copy and fill in secrets
-cp .env.example .env.local
-
-# Install dependencies
-pnpm install
-
-# Apply database migrations (run against your Supabase project via psql or Supabase CLI)
-# Step 1 — base table (idempotent):
-#   supabase/migrations/202611260001_create_short_links.sql
-# Step 2 — harden + new tables + stored procedures:
-#   supabase/migrations/202611260002_harden_short_links.sql
-```
-
-> [!IMPORTANT]
-> Run migrations in order. Both are idempotent (use `IF NOT EXISTS`, `CREATE OR REPLACE`).
-> Do NOT run destructive SQL against production databases.
+> **Note:** Browser UI verification scenarios (creator token notice, local storage manager, QR download) are documented on the frontend branch (`feat/t-00035-link-shortener-frontend`).
 
 ---
 
-## 2. Automated Tests
+## 1. Environment & Setup
 
-```bash
-# Backend service tests (Node environment, no browser globals)
-pnpm test:links
+1. Ensure `.env.local` is configured with:
+   - `SUPABASE_URL`
+   - `SUPABASE_SERVICE_ROLE_KEY`
+   - `ADMIN_API_KEY`
+   - `IP_HASH_SALT`
+   - `PUBLIC_SITE_URL` (e.g. `http://localhost:3000` for local testing)
+2. Ensure both SQL migrations in `supabase/migrations/` have been applied in order:
+   - `202611260001_create_short_links.sql`
+   - `202611260002_harden_short_links.sql`
+3. Run automated backend checks:
 
-# UI helper tests (jsdom environment)
-pnpm test -- --testPathPattern="links-ui-helpers"
-
-# TypeScript check
+```powershell
 pnpm typecheck
-
-# Lint
-pnpm lint
-
-# Production build check
+pnpm test:links
 pnpm build
 ```
 
----
+Expected:
+- `pnpm typecheck` exits with `0`
+- `pnpm test:links` passes **11 test files, 112 tests**
+- `pnpm build` completes cleanly with `/go/[code]` and `/api/admin/links/*` as dynamic routes
 
-## 3. Backend Verification (Automated — `pnpm test:links`)
+4. Start the local Next.js development server:
 
-| Test File | Coverage |
-|---|---|
-| `links-url-policy.test.ts` | HTTPS-only, private IP rejection, self-redirect, Punycode flag |
-| `links-reserved.test.ts` | All tool slugs, system paths, brand impersonation |
-| `links-slug.test.ts` | Base62 generation, collision retry, format validation |
-| `links-password.test.ts` | PBKDF2 hash, verify, legacy upgrade, constant-time comparison |
-| `links-token.test.ts` | CSPRNG generation, SHA-256 storage, constant-time verify |
-| `links-blocklist.test.ts` | Exact + suffix domain matching |
-| `links-ip.test.ts` | Netlify header trust, XFF fallback in dev, session cookie |
-| `links-ratelimit.test.ts` | All limit configurations, fail-open/closed behavior |
-| `links-redirect.test.ts` | Full decision matrix, origin validation |
-| `links-service.test.ts` | Create, resolve, getLinkInfo, updateLink, reportLink |
-| `links-admin.test.ts` | Auth, rate limit, reports CRUD, status updates, blocklist |
+```powershell
+pnpm dev
+```
+
+By default, the Next.js server starts at `http://localhost:3000`.
 
 ---
 
-## 4. HTTP Verification (Manual — dev server required)
+## 2. Redirect Route Scenarios & `curl` Commands (`/go/[code]`)
 
-Start the dev server: `pnpm dev`
+### Scenario 1: Clean Active Link (HTTP 302 Found)
 
-### 4.1 Redirect Behavior
+Verify that visiting an active, unexpired, unprotected short link returns an immediate server-side HTTP 302 redirect with no client-side navigation.
 
-```bash
-# 302 for active link
-curl -v http://localhost:3000/go/TEST_CODE 2>&1 | grep -E "HTTP|Location"
-
-# 404 for missing link
-curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/go/does-not-exist
-
-# 410 for expired link
-curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/go/EXPIRED_CODE
-
-# Password form (200)
-curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/go/PASSWORD_CODE
-
-# Rate limit (429) — hammer the endpoint
-for i in $(seq 1 130); do curl -s -o /dev/null http://localhost:3000/go/TEST_CODE; done
+```powershell
+curl.exe -i "http://localhost:3000/go/<ACTIVE_CODE>"
 ```
 
-### 4.2 Security Headers
+**Expected Response:**
 
-```bash
-curl -sI http://localhost:3000/go/TEST_CODE | grep -E "Cache-Control|Referrer-Policy|X-Robots"
-# Expected:
-#   Cache-Control: no-store
-#   Referrer-Policy: no-referrer
-#   X-Robots-Tag: noindex
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/target-destination
+Cache-Control: no-store
+Referrer-Policy: no-referrer
+X-Robots-Tag: noindex
 ```
 
-### 4.3 Password POST
-
-```bash
-# Correct password → 302
-curl -v -X POST http://localhost:3000/go/PW_CODE \
-  -H "Origin: http://localhost:3000" \
-  -d "action=unlock&password=correct"
-
-# Wrong password → 401
-curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/go/PW_CODE \
-  -H "Origin: http://localhost:3000" \
-  -d "action=unlock&password=wrong"
-
-# Cross-origin POST → 403
-curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/go/TEST_CODE \
-  -H "Origin: https://evil.example.com" \
-  -d "action=continue"
-```
-
-### 4.4 Admin API
-
-```bash
-# List reports (requires ADMIN_API_KEY)
-curl -s -H "x-admin-api-key: $ADMIN_API_KEY" \
-  http://localhost:3000/api/admin/links/reports | jq .
-
-# Update link status
-curl -s -X POST http://localhost:3000/api/admin/links/status \
-  -H "Content-Type: application/json" \
-  -H "x-admin-api-key: $ADMIN_API_KEY" \
-  -d '{"code":"TEST_CODE","status":"blocked"}' | jq .
-
-# Add blocked domain
-curl -s -X POST http://localhost:3000/api/admin/links/blocked-domains \
-  -H "Content-Type: application/json" \
-  -H "x-admin-api-key: $ADMIN_API_KEY" \
-  -d '{"domain":"malicious.example.com"}' | jq .
-
-# Unauthorized → 401
-curl -s -o /dev/null -w "%{http_code}" \
-  -H "x-admin-api-key: wrong-key" \
-  http://localhost:3000/api/admin/links/reports
-
-# Unconfigured → 500
-curl -s -o /dev/null -w "%{http_code}" \
-  http://localhost:3000/api/admin/links/reports
-```
+_Note: No JavaScript or HTML page is rendered for an active, unprotected link._
 
 ---
 
-## 5. Database Security Verification
+### Scenario 2: Click Count Increment (Atomic `register_click`)
 
-Run directly against your Supabase SQL editor (or psql):
+Verify that every 302 redirect durably increments the click counter by exactly 1.
 
 ```sql
--- Verify anon role CANNOT call rate_limit_hit
-SET ROLE anon;
-SELECT * FROM public.rate_limit_hit('test', 60, 10);
--- Expected: ERROR: permission denied
+-- Before request (in Supabase SQL editor):
+SELECT code, clicks, last_clicked_at FROM short_links WHERE code = '<ACTIVE_CODE>';
+```
 
--- Verify service_role CAN call it (run as postgres/service_role)
-SELECT * FROM public.rate_limit_hit('test', 60, 10);
--- Expected: row with allowed, remaining, retry_after
+```powershell
+curl.exe -i "http://localhost:3000/go/<ACTIVE_CODE>"
+```
 
--- Verify existing links survived migration
-SELECT code, status, creator_token_hash IS NOT NULL AS has_token
-FROM public.short_links
-ORDER BY created_at
-LIMIT 10;
+```sql
+-- After request:
+SELECT code, clicks, last_clicked_at FROM short_links WHERE code = '<ACTIVE_CODE>';
+-- Result: clicks increased by 1 and last_clicked_at updated.
+```
 
--- Verify new tables exist
-SELECT tablename FROM pg_tables
+---
+
+### Scenario 3: Non-Existent Link (HTTP 404 Not Found)
+
+Verify that querying an unknown slug returns HTTP 404 with `noindex` header.
+
+```powershell
+curl.exe -i "http://localhost:3000/go/non-existent-code"
+```
+
+**Expected Response:**
+
+```http
+HTTP/1.1 404 Not Found
+X-Robots-Tag: noindex
+Content-Type: text/html; charset=utf-8
+```
+
+_Renders the "Link not found" shell with a link back to `/link-shortener`._
+
+---
+
+### Scenario 4: Expired, Disabled, or Blocked Links (HTTP 410 Gone)
+
+Verify that inactive or policy-violating links return HTTP 410 Gone with `noindex` header.
+
+```powershell
+# Expired link
+curl.exe -i "http://localhost:3000/go/<EXPIRED_CODE>"
+
+# Disabled link
+curl.exe -i "http://localhost:3000/go/<DISABLED_CODE>"
+
+# Blocked link / blocked domain
+curl.exe -i "http://localhost:3000/go/<BLOCKED_CODE>"
+```
+
+**Expected Response:**
+
+```http
+HTTP/1.1 410 Gone
+X-Robots-Tag: noindex
+Content-Type: text/html; charset=utf-8
+```
+
+_Renders the corresponding 410 shell ("This short link has expired" / "This link has been disabled" / "This link has been removed")._
+
+---
+
+### Scenario 5: Password-Protected Link (HTTP 200 Form -> Native POST 302)
+
+Verify that password-protected links do not disclose the destination URL until unlocked.
+
+```powershell
+# Step 1: Initial GET renders password prompt (200 OK)
+curl.exe -i "http://localhost:3000/go/<PASSWORD_CODE>"
+```
+
+**Expected Initial Response:**
+
+- Status: `200 OK`
+- Header: `X-Robots-Tag: noindex`
+- Body: Form containing `<input type="hidden" name="action" value="unlock" />` and password input. Target URL is completely absent from the HTML.
+
+```powershell
+# Step 2: Native form POST with incorrect password
+curl.exe -i -X POST "http://localhost:3000/go/<PASSWORD_CODE>" `
+  -H "Host: localhost:3000" `
+  -H "Origin: http://localhost:3000" `
+  -F "action=unlock" `
+  -F "password=wrong-password"
+```
+
+**Expected Response:** `401 Unauthorized` with `X-Robots-Tag: noindex`.
+
+```powershell
+# Step 3: Native form POST with correct password
+curl.exe -i -X POST "http://localhost:3000/go/<PASSWORD_CODE>" `
+  -H "Host: localhost:3000" `
+  -H "Origin: http://localhost:3000" `
+  -F "action=unlock" `
+  -F "password=<CORRECT_PASSWORD>"
+```
+
+**Expected Response:**
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/secret-target
+Cache-Control: no-store
+Referrer-Policy: no-referrer
+X-Robots-Tag: noindex
+```
+
+---
+
+### Scenario 6: Flagged Link Interstitial (`pending_review`)
+
+Verify that a link flagged for community review renders the interstitial warning with destination preview and requires explicit continuation.
+
+```powershell
+# Step 1: Initial GET renders interstitial notice
+curl.exe -i "http://localhost:3000/go/<FLAGGED_CODE>"
+```
+
+**Expected Initial Response:**
+
+- Status: `200 OK`
+- Warning notice: "Community Review Warning"
+- Shows destination URL preview.
+- Includes `<form method="post"><input type="hidden" name="action" value="continue" /></form>`.
+
+```powershell
+# Step 2: Native form POST to continue to destination
+curl.exe -i -X POST "http://localhost:3000/go/<FLAGGED_CODE>" `
+  -H "Host: localhost:3000" `
+  -H "Origin: http://localhost:3000" `
+  -F "action=continue"
+```
+
+**Expected Response:**
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/target-destination
+Cache-Control: no-store
+Referrer-Policy: no-referrer
+X-Robots-Tag: noindex
+```
+
+---
+
+### Scenario 7: Cross-Origin POST CSRF Protection (HTTP 403 Forbidden)
+
+Verify that cross-site POST submissions are blocked by origin validation.
+
+```powershell
+curl.exe -i -X POST "http://localhost:3000/go/<ANY_CODE>" `
+  -H "Host: localhost:3000" `
+  -H "Origin: https://malicious-attacker.com" `
+  -F "action=continue"
+```
+
+**Expected Response:**
+
+```http
+HTTP/1.1 403 Forbidden
+X-Robots-Tag: noindex
+
+Forbidden: Cross-site request rejected
+```
+
+---
+
+### Scenario 8: Resolution Rate Limiting (HTTP 429 Too Many Requests)
+
+Verify that exceeding rate limits returns HTTP 429 with `Retry-After`.
+
+```powershell
+# Execute rapid resolution loop (run concurrently in PowerShell jobs to hit 120 req/60s window)
+1..130 | ForEach-Object {
+  Start-Job -ScriptBlock { curl.exe -s -o NUL -w "%{http_code}`n" "http://localhost:3000/go/<ACTIVE_CODE>" }
+} | Receive-Job -Wait -AutoRemoveJob
+```
+
+**Expected Response on Limit Exceeded:**
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 60
+X-Robots-Tag: noindex
+```
+
+---
+
+### Scenario 9: Anonymous Reporting Session Cookie
+
+Verify that requests without a trusted proxy IP header receive a signed reporting cookie with `HttpOnly; SameSite=Lax` (and `Secure` in production HTTPS).
+
+```powershell
+curl.exe -i "http://localhost:3000/go/<ANY_CODE>"
+```
+
+**Expected Header:**
+
+```http
+Set-Cookie: _mrv_rep_sess=...; Path=/; Max-Age=7200; HttpOnly; SameSite=Lax
+```
+
+---
+
+## 3. Administrative Moderation API (`/api/admin/links/*`)
+
+All admin endpoints run on dedicated Next.js Route Handlers under `app/api/admin/links/*`. They are strictly machine-to-machine, protected by the `x-admin-api-key` header, and return `Cache-Control: no-store` on all responses.
+
+Set the admin API key environment variable in your PowerShell session for testing (matching `ADMIN_API_KEY` in `.env.local`):
+
+```powershell
+$env:ADMIN_API_KEY = "your-local-test-admin-key"
+```
+
+---
+
+### Scenario 10: Unauthorized Request (Missing / Incorrect Key)
+
+Verify that missing or incorrect API keys return HTTP 401 with a generic error message.
+
+```powershell
+# Missing key
+curl.exe -i "http://localhost:3000/api/admin/links/reports"
+
+# Wrong key
+curl.exe -i "http://localhost:3000/api/admin/links/reports" `
+  -H "x-admin-api-key: invalid-key"
+```
+
+**Expected Response:**
+
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json; charset=utf-8
+Cache-Control: no-store
+
+{"error":{"code":"unauthorized","message":"Missing or invalid admin API key."}}
+```
+
+---
+
+### Scenario 11: List Abuse Reports (`GET /api/admin/links/reports`)
+
+List abuse reports with optional status filtering and pagination (limit clamped to 100).
+
+```powershell
+# List all reports (default 50)
+curl.exe -i "http://localhost:3000/api/admin/links/reports" `
+  -H "x-admin-api-key: $env:ADMIN_API_KEY"
+
+# Filter by open status with pagination
+curl.exe -i "http://localhost:3000/api/admin/links/reports?status=open&limit=20&offset=0" `
+  -H "x-admin-api-key: $env:ADMIN_API_KEY"
+```
+
+**Expected Response:**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Cache-Control: no-store
+
+{
+  "data": [
+    {
+      "id": "11111111-2222-3333-4444-555555555555",
+      "code": "suspicious-slug",
+      "reason": "phishing",
+      "details": "Lookalike login portal",
+      "status": "open",
+      "is_unverified": false,
+      "created_at": "2026-11-24T12:00:00.000Z"
+    }
+  ],
+  "count": 1,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+---
+
+### Scenario 12: Review/Resolve an Abuse Report (`PATCH /api/admin/links/reports`)
+
+Transition an abuse report's moderation status to `reviewed`, `actioned`, or `dismissed`.
+
+```powershell
+curl.exe -i -X PATCH "http://localhost:3000/api/admin/links/reports" `
+  -H "x-admin-api-key: $env:ADMIN_API_KEY" `
+  -H "Content-Type: application/json" `
+  -d '{\"reportId\":\"11111111-2222-3333-4444-555555555555\",\"status\":\"reviewed\"}'
+```
+
+**Expected Response:**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Cache-Control: no-store
+
+{"ok":true,"reportId":"11111111-2222-3333-4444-555555555555","status":"reviewed"}
+```
+
+---
+
+### Scenario 13: Update Link Status & Restore (`POST /api/admin/links/status`)
+
+Change a link's moderation status. When restoring to `active`, the database runs `admin_restore_link()` to transactionally reset status and resolve open reports.
+
+```powershell
+# Block a link and add its domain to the global blocklist
+curl.exe -i -X POST "http://localhost:3000/api/admin/links/status" `
+  -H "x-admin-api-key: $env:ADMIN_API_KEY" `
+  -H "Content-Type: application/json" `
+  -d '{\"code\":\"suspicious-slug\",\"status\":\"blocked\",\"addDomain\":true}'
+
+# Restore a flagged or blocked link back to active
+curl.exe -i -X POST "http://localhost:3000/api/admin/links/status" `
+  -H "x-admin-api-key: $env:ADMIN_API_KEY" `
+  -H "Content-Type: application/json" `
+  -d '{\"code\":\"suspicious-slug\",\"status\":\"active\"}'
+```
+
+**Expected Response:**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Cache-Control: no-store
+
+{"ok":true,"code":"suspicious-slug","status":"active"}
+```
+
+---
+
+### Scenario 14: Manage Blocked Domains (`/api/admin/links/blocked-domains`)
+
+Add, remove, and inspect domains in the global target blocklist.
+
+```powershell
+# Add a blocked domain
+curl.exe -i -X POST "http://localhost:3000/api/admin/links/blocked-domains" `
+  -H "x-admin-api-key: $env:ADMIN_API_KEY" `
+  -H "Content-Type: application/json" `
+  -d '{\"domain\":\"phishing-gang.net\",\"source\":\"admin_investigation\"}'
+
+# List blocked domains
+curl.exe -i "http://localhost:3000/api/admin/links/blocked-domains" `
+  -H "x-admin-api-key: $env:ADMIN_API_KEY"
+
+# Remove a blocked domain
+curl.exe -i -X DELETE "http://localhost:3000/api/admin/links/blocked-domains?domain=phishing-gang.net" `
+  -H "x-admin-api-key: $env:ADMIN_API_KEY"
+```
+
+**Expected Response (Add):**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Cache-Control: no-store
+
+{"ok":true,"domain":"phishing-gang.net","source":"admin_investigation"}
+```
+
+---
+
+## 4. Database Security & Cleanup Checks
+
+Verify Row-Level Security and stored data in Supabase SQL Editor:
+
+```sql
+-- Confirm RLS is enabled on all link-shortener tables
+SELECT tablename, rowsecurity
+FROM pg_tables
 WHERE schemaname = 'public'
-  AND tablename IN ('link_reports', 'blocked_domains', 'rate_limits');
+  AND tablename IN ('short_links', 'link_reports', 'blocked_domains', 'rate_limit_counters');
+
+-- Confirm no raw IPs are stored (only salted hashes)
+SELECT reporter_ip_hash FROM link_reports LIMIT 5;
+SELECT key FROM rate_limit_counters LIMIT 5;
 ```
 
 ---
 
-## 6. Frontend Verification (Manual)
+## 5. T-00036 Release Blockers (Not Yet Implemented)
 
-| Scenario | Expected |
-|---|---|
-| Enter URL and click Shorten Now | Short link appears, creator token notice shown |
-| Copy URL button | URL copied to clipboard |
-| Copy Key button in notice | Token copied |
-| Dismiss notice, reload page | "Manage Your Short Links" section shows the link |
-| Refresh stats button | Click count and status update |
-| Disable Link button | Status changes to Disabled |
-| Enable Link button | Status changes to Active |
-| Edit Expiry → save | Expiry timestamp updates |
-| Set/Remove password | Password status updates |
-| Import Link Key panel | Paste code + token → link appears in manager |
-| Forget link | Link removed from list (not deleted from DB) |
-| Enter blocked domain URL | Error: blocked_domain |
-| Enter reserved slug | Error: reserved |
-| QR toggle | QR code appears, Download PNG works |
-| Mobile viewport | Layout is responsive, no overflow |
+The following items must be resolved before general public release:
 
----
-
-## 7. Release Blockers (T-00036)
-
-The following T-00036 items are **implemented** in T-00034/T-00035:
-
-- ✅ URL safety validation (private IP, scheme, credentials, self-redirect)
-- ✅ Blocked domain checks at creation + redirect time (FR-11)
-- ✅ Reporting flow with deduplication (unique constraint on `code, reporter_hash`)
-- ✅ Automatic `pending_review` escalation at ≥3 distinct verified reporters (FR-09)
-- ✅ Admin moderation (reports, status, blocked domains)
-- ✅ Rate limiting (all 7 categories per DESIGN.md §10)
-- ✅ Structured audit logs (`console.info` JSON events)
-- ✅ Security headers on all redirect responses
-- ✅ Cross-origin POST protection (Origin + Sec-Fetch-Site validation)
-
-The following items are **NOT implemented** in T-00034/T-00035 and are explicit **release blockers** before production launch:
-
-| Blocker | Description | Required in |
-|---|---|---|
-| ❌ Written Abuse Policy | A public `/terms` or `/abuse-policy` page linked from the tool | T-00036 |
-| ❌ Rate-limit cleanup scheduler | `cleanup_rate_limits()` RPC needs a periodic trigger | T-00036 (ops) |
-| ❌ CSP headers | Content-Security-Policy not yet set for the redirect HTML forms | T-00036 |
-| ❌ Automated blocklist feed | Integration with external URL reputation APIs | T-00036 (optional v2) |
-
-> [!CAUTION]
-> Do not launch the link shortener feature publicly without resolving the release blockers above.
-> The rate_limits table will grow unbounded without the cleanup scheduler.
-
----
-
-## 8. Rate-Limit Cleanup — Scheduler Recommendation
-
-The `public.cleanup_rate_limits()` RPC prunes records older than 2 hours.
-
-**Option A — Supabase pg_cron** (recommended if available):
-```sql
--- Enable pg_cron extension in Supabase dashboard
-SELECT cron.schedule('cleanup-rate-limits', '0 * * * *', $$
-  SELECT public.cleanup_rate_limits();
-$$);
-```
-Pros: runs inside the database, no external service needed.
-Cons: pg_cron is not available on all Supabase plans (Pro+ required).
-
-**Option B — Scheduled Edge Function** (Netlify/Vercel cron):
-```js
-// netlify/functions/cleanup-rate-limits.mts (scheduled)
-export default async () => {
-  const { createClient } = await import("@supabase/supabase-js");
-  const db = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-  await db.rpc("cleanup_rate_limits");
-};
-```
-Configure in `netlify.toml`:
-```toml
-[functions."cleanup-rate-limits"]
-  schedule = "0 * * * *"
-```
-Pros: works on all Supabase plans.
-Cons: requires a separate function deployment.
-
-**Decision:** Confirm deployment platform (Netlify Functions vs Vercel Cron vs Supabase pg_cron) before implementing. Do not introduce a scheduler without approval.
+1. **Rate-limit cleanup scheduler:** Configure `pg_cron` (recommended: `SELECT cron.schedule('prune-rate-limits', '0 * * * *', $$DELETE FROM public.rate_limit_counters WHERE window_end < now() - interval '1 hour';$$);`) or a scheduled serverless function to prune expired `rate_limit_counters` rows.
+2. **Legal / Abuse pages:** Implement `/terms` and `/abuse-policy` routes linked from redirect interstitials.
+3. **CSP headers:** Add strict `Content-Security-Policy` headers on inline HTML pages rendered by `app/go/[code]/route.ts`.
+4. **Automated blocklist feed:** Currently domains are added/removed manually via `/api/admin/links/blocked-domains`.
