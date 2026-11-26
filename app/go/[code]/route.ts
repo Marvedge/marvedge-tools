@@ -227,6 +227,7 @@ export async function GET(
             "Retry-After": String(result.retryAfter),
             "X-Robots-Tag": "noindex",
             "Cache-Control": "no-store",
+            ...(setCookie ? { "Set-Cookie": setCookie } : {}),
           },
         },
       );
@@ -239,6 +240,7 @@ export async function GET(
           headers: {
             "Content-Type": "text/html; charset=utf-8",
             ...REDIRECT_HEADERS,
+            ...(setCookie ? { "Set-Cookie": setCookie } : {}),
           },
         },
       );
@@ -251,6 +253,7 @@ export async function GET(
           headers: {
             "Content-Type": "text/html; charset=utf-8",
             ...REDIRECT_HEADERS,
+            ...(setCookie ? { "Set-Cookie": setCookie } : {}),
           },
         },
       );
@@ -266,6 +269,7 @@ export async function GET(
           headers: {
             "Content-Type": "text/html; charset=utf-8",
             ...REDIRECT_HEADERS,
+            ...(setCookie ? { "Set-Cookie": setCookie } : {}),
           },
         },
       );
@@ -279,6 +283,7 @@ export async function GET(
           headers: {
             "Content-Type": "text/html; charset=utf-8",
             ...REDIRECT_HEADERS,
+            ...(setCookie ? { "Set-Cookie": setCookie } : {}),
           },
         },
       );

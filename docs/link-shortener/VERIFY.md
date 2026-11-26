@@ -239,16 +239,14 @@ Forbidden: Cross-site request rejected
 
 ### Scenario 8: Resolution Rate Limiting (HTTP 429 Too Many Requests)
 
-Verify that exceeding rate limits returns HTTP 429 with `Retry-After`.
+Verify that exceeding rate limits (120 requests per 60s window) returns HTTP 429 with `Retry-After`.
+Use a fast single-process burst (avoid `Start-Job`, which spawns 130 processes slowly and can straddle a 60s window boundary):
 
 ```powershell
-# Execute rapid resolution loop (run concurrently in PowerShell jobs to hit 120 req/60s window)
-1..130 | ForEach-Object {
-  Start-Job -ScriptBlock { curl.exe -s -o NUL -w "%{http_code}`n" "http://localhost:3000/go/<ACTIVE_CODE>" }
-} | Receive-Job -Wait -AutoRemoveJob
+node -e "Promise.all(Array.from({length:125}, () => fetch('http://localhost:3000/go/<ACTIVE_CODE>', {redirect:'manual'}).then(r => r.status))).then(s => console.log({ ok: s.filter(x => x === 302 || x === 200).length, rateLimited: s.filter(x => x === 429).length }))"
 ```
 
-**Expected Response on Limit Exceeded:**
+**Expected Output:** `ok: 120`, `rateLimited: 5`, with HTTP `429` responses containing:
 
 ```http
 HTTP/1.1 429 Too Many Requests
@@ -260,16 +258,18 @@ X-Robots-Tag: noindex
 
 ### Scenario 9: Anonymous Reporting Session Cookie
 
-Verify that requests without a trusted proxy IP header receive a signed reporting cookie with `HttpOnly; SameSite=Lax` (and `Secure` in production HTTPS).
+Verify that requests without a trusted client IP receive a signed reporting cookie (`_mrv_rep_sess`).
+
+> **Note for `pnpm dev`:** In development (`NODE_ENV=development`), Next.js automatically populates `x-forwarded-for: ::1`, so `getClientIp()` resolves a local IP and intentionally skips issuing the fallback cookie. To simulate an unverified/no-IP client in dev, send an invalid `x-forwarded-for` header (or test under `NODE_ENV=production` with `pnpm start` and no `x-nf-client-connection-ip`):
 
 ```powershell
-curl.exe -i "http://localhost:3000/go/<ANY_CODE>"
+curl.exe -i -H "x-forwarded-for: invalid" "http://localhost:3000/go/<ANY_CODE>"
 ```
 
 **Expected Header:**
 
 ```http
-Set-Cookie: _mrv_rep_sess=...; Path=/; Max-Age=7200; HttpOnly; SameSite=Lax
+Set-Cookie: _mrv_rep_sess=...; Path=/; Max-Age=7200; HttpOnly; Secure; SameSite=Lax
 ```
 
 ---

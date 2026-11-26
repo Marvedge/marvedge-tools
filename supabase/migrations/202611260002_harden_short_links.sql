@@ -154,9 +154,10 @@ BEGIN
     RAISE EXCEPTION 'p_key cannot be empty';
   END IF;
 
-  -- Epoch-aligned fixed time window
-  v_window := date_trunc('second', now())
-    - (EXTRACT(EPOCH FROM now())::bigint % p_window_seconds) * interval '1 second';
+  -- Epoch-aligned fixed time window (floor to avoid ::bigint rounding across seconds)
+  v_window := to_timestamp(
+    (floor(EXTRACT(EPOCH FROM now()))::bigint / p_window_seconds) * p_window_seconds
+  );
 
   INSERT INTO public.rate_limits (key, window_start, count)
     VALUES (p_key, v_window, 1)

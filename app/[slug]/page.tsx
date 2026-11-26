@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { tools } from "@/lib/tools";
@@ -39,7 +40,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   };
 }
 
-export default async function DynamicToolPage({ params }: Props) {
+async function ToolPageContent({ params }: Props) {
   const { slug } = await params;
   const tool = tools.find((t) => t.slug === slug);
   if (!tool) notFound();
@@ -56,5 +57,13 @@ export default async function DynamicToolPage({ params }: Props) {
       />
       <ToolPage tool={tool} />
     </>
+  );
+}
+
+export default function DynamicToolPage({ params }: Props) {
+  return (
+    <Suspense fallback={null}>
+      <ToolPageContent params={params} />
+    </Suspense>
   );
 }
