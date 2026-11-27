@@ -382,46 +382,157 @@ async function recordVideo(
   bitrate: number,
   draw: (ctx: CanvasRenderingContext2D) => void,
   onProgress: (p: number) => void,
-) {
-  const c = document.createElement("canvas");
-  c.width = w;
-  c.height = h;
-  const ctx = c.getContext("2d")!;
-  const stream = c.captureStream(30);
-  const vs = (vid as HTMLVideoElement & { captureStream?: () => MediaStream }).captureStream?.();
-  vs?.getAudioTracks().forEach((t) => stream.addTrack(t));
-  const mime =
-    ["video/mp4;codecs=avc1", "video/webm;codecs=vp9", "video/webm"].find((m) =>
-      MediaRecorder.isTypeSupported(m),
-    ) ?? "video/webm";
-  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: bitrate });
-  const chunks: Blob[] = [];
-  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-  await seek(vid, 0);
-  vid.muted = false;
-  const done = new Promise<Blob>((res) => {
-    rec.onstop = () => res(new Blob(chunks, { type: mime.split(";")[0] ?? "video/webm" }));
+  signal?: AbortSignal,
+): Promise<Blob> {
+  if (signal?.aborted) {
+    throw new DOMException("Recording cancelled", "AbortError");
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not create video canvas");
+
+  const stream = canvas.captureStream(30);
+  const videoStream = (
+    vid as HTMLVideoElement & {
+      captureStream?: () => MediaStream;
+    }
+  ).captureStream?.();
+
+  videoStream?.getAudioTracks().forEach((track) => {
+    stream.addTrack(track);
   });
-  rec.start(500);
+
+  const mime =
+    [
+      "video/mp4;codecs=avc1",
+      "video/webm;codecs=vp9",
+      "video/webm",
+    ].find((type) => MediaRecorder.isTypeSupported(type)) ??
+    "video/webm";
+
+  const recorder = new MediaRecorder(stream, {
+    mimeType: mime,
+    videoBitsPerSecond: bitrate,
+  });
+
+  const chunks: Blob[] = [];
   let raf = 0;
-  const loop = () => {
-    draw(ctx);
-    onProgress(Math.round((vid.currentTime / vid.duration) * 100));
-    raf = requestAnimationFrame(loop);
-  };
-  vid.onended = () => {
-    cancelAnimationFrame(raf);
-    rec.stop();
-  };
-  await vid.play();
-  loop();
-  return done;
+  let settled = false;
+
+  const previousEnded = vid.onended;
+  const previousMuted = vid.muted;
+
+  return new Promise<Blob>((resolve, reject) => {
+    const cleanup = () => {
+      cancelAnimationFrame(raf);
+      vid.pause();
+      vid.onended = previousEnded;
+      vid.muted = previousMuted;
+
+      stream.getTracks().forEach((track) => track.stop());
+      videoStream?.getTracks().forEach((track) => track.stop());
+
+      signal?.removeEventListener("abort", cancel);
+    };
+
+    const finish = (blob?: Blob, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+
+      if (error) reject(error);
+      else if (blob) resolve(blob);
+      else reject(new Error("Recording failed"));
+    };
+
+    const cancel = () => {
+      if (recorder.state !== "inactive") {
+        recorder.stop();
+      }
+
+      finish(
+        undefined,
+        new DOMException("Recording cancelled", "AbortError"),
+      );
+    };
+
+    signal?.addEventListener("abort", cancel, { once: true });
+
+    recorder.ondataavailable = (event) => {
+      if (event.data.size) chunks.push(event.data);
+    };
+
+    recorder.onerror = () => {
+      finish(undefined, new Error("Video recording failed"));
+    };
+
+    recorder.onstop = () => {
+      if (settled) return;
+
+      finish(
+        new Blob(chunks, {
+          type: mime.split(";")[0] ?? "video/webm",
+        }),
+      );
+    };
+
+    vid.onended = () => {
+      cancelAnimationFrame(raf);
+
+      if (recorder.state !== "inactive") {
+        recorder.stop();
+      }
+    };
+
+    const loop = () => {
+      if (settled || signal?.aborted) return;
+
+      draw(ctx);
+      onProgress(
+        Math.round((vid.currentTime / vid.duration) * 100),
+      );
+
+      raf = requestAnimationFrame(loop);
+    };
+
+    const start = async () => {
+      try {
+        await seek(vid, 0);
+
+        if (signal?.aborted) {
+          cancel();
+          return;
+        }
+
+        vid.muted = false;
+        recorder.start(500);
+
+        await vid.play();
+
+        if (!settled) loop();
+      } catch (error) {
+        finish(
+          undefined,
+          error instanceof Error
+            ? error
+            : new Error("Could not start video recording"),
+        );
+      }
+    };
+
+    void start();
+  });
 }
 const extOf = (b: Blob) => (b.type.includes("mp4") ? "mp4" : "webm");
 
 /* ---------- Video Compressor ---------- */
 export function VideoCompressor() {
   const v = useVideo();
+  const abortRef = useRef<AbortController | null>(null);
   const [height, setHeight] = useState(720);
   const [mbps, setMbps] = useState(1.5);
   const [p, setP] = useState(0);
@@ -429,25 +540,53 @@ export function VideoCompressor() {
   const [res, setRes] = useState<Res | null>(null);
   const est = v.dur ? (mbps * 1e6 * v.dur) / 8 : 0;
   const run = async () => {
-    const vid = v.ref.current!;
+    const vid = v.ref.current;
+    if (!vid || !v.file || busy) return;
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setBusy(true);
     setRes(null);
-    const h = Math.min(height, vid.videoHeight);
-    const w = Math.round(((vid.videoWidth / vid.videoHeight) * h) / 2) * 2;
-    const blob = await recordVideo(
-      vid,
-      w,
-      h,
-      mbps * 1e6,
-      (ctx) => ctx.drawImage(vid, 0, 0, w, h),
-      setP,
-    );
-    setRes({
-      blob,
-      url: URL.createObjectURL(blob),
-      name: `${baseName(v.file!.name)}-compressed.${extOf(blob)}`,
-    });
-    setBusy(false);
+    setP(0);
+
+    try {
+      const h = Math.min(height, vid.videoHeight);
+      const w =
+        Math.round(((vid.videoWidth / vid.videoHeight) * h) / 2) * 2;
+
+      const blob = await recordVideo(
+        vid,
+        w,
+        h,
+        mbps * 1e6,
+        (ctx) => ctx.drawImage(vid, 0, 0, w, h),
+        setP,
+        controller.signal,
+      );
+
+      if (controller.signal.aborted) return;
+
+      setRes({
+        blob,
+        url: URL.createObjectURL(blob),
+        name: `${baseName(v.file.name)}-compressed.${extOf(blob)}`,
+      });
+    } catch (error) {
+      if (
+        error instanceof DOMException &&
+        error.name === "AbortError"
+      ) {
+        return;
+      }
+
+      console.error("Video compression failed:", error);
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setBusy(false);
+      }
+    }
   };
   return (
     <Panel>
@@ -507,7 +646,20 @@ export function VideoCompressor() {
             <p className="text-xs text-[#4A4740]">
               Processing plays the video in real time inside your browser — keep this tab open.
             </p>
-            <Btn variant="ghost" onClick={v.reset}>
+            <Btn
+              variant="ghost"
+              onClick={() => {
+                abortRef.current?.abort();
+                abortRef.current = null;
+
+                if (res) URL.revokeObjectURL(res.url);
+
+                setRes(null);
+                setP(0);
+                setBusy(false);
+                v.reset();
+              }}
+            >
               Choose another video
             </Btn>
           </div>
@@ -625,11 +777,10 @@ export function AspectRatio() {
                     type="button"
                     aria-pressed={ratio === r}
                     onClick={() => setRatio(r)}
-                    className={`cursor-pointer rounded-full border px-3 py-1.5 text-xs font-semibold tabular-nums transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-                      ratio === r
-                        ? "border-[#000000] bg-[#000000] text-[#FFFFFF]"
-                        : "border-[#D6CCB5] bg-[#FAF7F0] text-[#4A4740] hover:border-[#7895B2] hover:bg-[#FFFFFF] hover:text-[#000000]"
-                    }`}
+                    className={`cursor-pointer rounded-full border px-3 py-1.5 text-xs font-semibold tabular-nums transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${ratio === r
+                      ? "border-[#000000] bg-[#000000] text-[#FFFFFF]"
+                      : "border-[#D6CCB5] bg-[#FAF7F0] text-[#4A4740] hover:border-[#7895B2] hover:bg-[#FFFFFF] hover:text-[#000000]"
+                      }`}
                   >
                     {r}
                   </button>
@@ -767,9 +918,9 @@ export function GifCompressor() {
               if (
                 !first &&
                 Math.abs(c[0]! - shown[o]!) +
-                  Math.abs(c[1]! - shown[o + 1]!) +
-                  Math.abs(c[2]! - shown[o + 2]!) <=
-                  18
+                Math.abs(c[1]! - shown[o + 1]!) +
+                Math.abs(c[2]! - shown[o + 2]!) <=
+                18
               ) {
                 index[p] = T;
               } else {
