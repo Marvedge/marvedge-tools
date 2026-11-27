@@ -17,3 +17,23 @@ export {
   sanitizeDownloadFilename,
   type DownloadBlobOptions,
 } from "./downloadBlob";
+export {
+  optimizeCanvasToPng,
+  crc32,
+  type PngOptimizationLevel,
+} from "./pngOptimizer";
+export {
+  compressSingleImage,
+  compressBatch,
+  createZipArchive,
+  calculateSavings,
+  resolveUniqueFilenames,
+  isCompressedItem,
+  isCompressionFailure,
+  type CompressionFormat,
+  type CompressionOptions,
+  type BatchItemInput,
+  type CompressedItem,
+  type CompressionFailure,
+  type CompressionResult,
+} from "./compressImage";

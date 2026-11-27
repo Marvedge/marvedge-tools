@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import JSZip from "jszip";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
-import { AlertTriangle, ArrowDown, ArrowUp, Check, Download, Globe, IdCard, LayoutGrid, Loader2, Mail, Phone, Printer, Type, Upload, Wifi, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowRight, ArrowUp, Check, Download, Globe, IdCard, LayoutGrid, Loader2, Mail, Phone, Printer, Type, Upload, Wifi, X } from "lucide-react";
 import { loadSample } from "@/lib/samples";
 import { PresetPicker } from "@/components/tools/PresetPicker";
 
@@ -18,78 +18,584 @@ import {
   correctImageOrientation,
   canvasToBlob,
   downloadBlob,
+  compressSingleImage,
+  compressBatch,
+  isCompressedItem,
+  createZipArchive,
+  calculateSavings,
+  resolveUniqueFilenames,
+  type CompressionFormat,
+  type CompressedItem,
+  type BatchItemInput,
+  type PngOptimizationLevel,
   type SupportedCanvasOutputType,
 } from "@/lib/image";
 
 type Out = { name: string; before: number; blob: Blob; url: string };
 
+interface ProcessedItem extends CompressedItem {
+  originalUrl: string;
+  compressedUrl: string;
+  savedBytes: number;
+  percentReduction: number;
+  isSmaller: boolean;
+}
+
+interface FileItem {
+  id: string;
+  file: File;
+  format: CompressionFormat;
+  quality: number;
+  pngLevel: PngOptimizationLevel;
+  busy: boolean;
+  originalUrl: string;
+  compressedUrl?: string;
+  output?: ProcessedItem;
+  error?: string;
+}
+
+function disambiguateItems(items: FileItem[]): FileItem[] {
+  const successItems = items.filter((it): it is FileItem & { output: ProcessedItem } => Boolean(it.output));
+  if (successItems.length <= 1) return items;
+
+  const names = successItems.map((it) => `${baseName(it.file.name)}-compressed.${extFor(it.output.format)}`);
+  const uniqueNames = resolveUniqueFilenames(names);
+
+  const nameMap = new Map<string, string>();
+  successItems.forEach((it, idx) => {
+    nameMap.set(it.id, uniqueNames[idx]);
+  });
+
+  return items.map((it) => {
+    if (it.output && nameMap.has(it.id)) {
+      return {
+        ...it,
+        output: {
+          ...it.output,
+          name: nameMap.get(it.id)!,
+        },
+      };
+    }
+    return it;
+  });
+}
+
 /* ---------- Image Compressor ---------- */
 export function ImageCompressor() {
-  const [files, setFiles] = useState<File[]>([]);
-  const [quality, setQuality] = useState(70);
-  const [format, setFormat] = useState("image/webp");
-  const [out, setOut] = useState<Out[]>([]);
+  const [fileItems, setFileItems] = useState<FileItem[]>([]);
+  const [globalFormat, setGlobalFormat] = useState<CompressionFormat>("image/webp");
+  const [globalQuality, setGlobalQuality] = useState(70);
+  const [globalPngLevel, setGlobalPngLevel] = useState<PngOptimizationLevel>("default");
   const [busy, setBusy] = useState(false);
   const [sampling, setSampling] = useState(false);
-  const run = async () => {
-    setBusy(true);
-    const res: Out[] = [];
-    for (const f of files) {
-      const bitmap = await decodeImage(f);
-      try {
-        const orientedCanvas = correctImageOrientation(bitmap);
-        const blob = await canvasToBlob(orientedCanvas, {
-          type: format as SupportedCanvasOutputType,
-          quality: quality / 100,
-          backgroundColor: format === "image/jpeg" ? "#ffffff" : null,
-        });
-        res.push({
-          name: `${baseName(f.name)}-compressed.${extFor(format)}`,
-          before: f.size,
-          blob,
-          url: URL.createObjectURL(blob),
-        });
-      } finally {
-        bitmap.close();
-      }
-    }
-    setOut(res); setBusy(false);
+  const [zipping, setZipping] = useState(false);
+  const [zipError, setZipError] = useState<string | null>(null);
+  const fileItemsRef = useRef<FileItem[]>([]);
+
+  // Keep ref synchronized for reliable unmount cleanup
+  useEffect(() => {
+    fileItemsRef.current = fileItems;
+  }, [fileItems]);
+
+  const revokeAllUrls = () => {
+    fileItemsRef.current.forEach((it) => {
+      if (it.originalUrl) URL.revokeObjectURL(it.originalUrl);
+      if (it.compressedUrl) URL.revokeObjectURL(it.compressedUrl);
+    });
   };
-  const saved = out.reduce((s, o) => s + o.before - o.blob.size, 0);
+
+  useEffect(() => {
+    return () => {
+      revokeAllUrls();
+    };
+  }, []);
+
+  const handleFiles = (newFiles: File[]) => {
+    if (newFiles.length === 0) return;
+    revokeAllUrls();
+
+    const created: FileItem[] = newFiles.map((file, idx) => ({
+      id: `file-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`,
+      file,
+      format: globalFormat,
+      quality: globalQuality,
+      pngLevel: globalPngLevel,
+      busy: false,
+      originalUrl: URL.createObjectURL(file),
+    }));
+
+    setFileItems(created);
+    setZipError(null);
+  };
+
+  const applyGlobalToAll = () => {
+    setFileItems((prev) =>
+      prev.map((item) => ({
+        ...item,
+        format: globalFormat,
+        quality: globalQuality,
+        pngLevel: globalPngLevel,
+      }))
+    );
+  };
+
+  const updateItemConfig = (
+    id: string,
+    patch: Partial<Pick<FileItem, "format" | "quality" | "pngLevel">>
+  ) => {
+    setFileItems((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    );
+  };
+
+  const compressSingle = async (id: string) => {
+    const target = fileItemsRef.current.find((it) => it.id === id);
+    if (!target) return;
+
+    setFileItems((prev) =>
+      prev.map((it) => (it.id === id ? { ...it, busy: true, error: undefined } : it))
+    );
+
+    try {
+      const res = await compressSingleImage(
+        target.file,
+        {
+          format: target.format,
+          quality: target.quality / 100,
+          pngLevel: target.pngLevel,
+        },
+        target.file.name,
+        target.id
+      );
+
+      if (target.compressedUrl) {
+        URL.revokeObjectURL(target.compressedUrl);
+      }
+      const compressedUrl = URL.createObjectURL(res.blob);
+      const { savedBytes, percentReduction, isSmaller } = calculateSavings(
+        res.originalSize,
+        res.compressedSize
+      );
+
+      const processed: ProcessedItem = {
+        ...res,
+        originalUrl: target.originalUrl,
+        compressedUrl,
+        savedBytes,
+        percentReduction,
+        isSmaller,
+      };
+
+      setFileItems((prev) => {
+        const next = prev.map((it) =>
+          it.id === id
+            ? {
+              ...it,
+              busy: false,
+              compressedUrl,
+              output: processed,
+              error: undefined,
+            }
+            : it
+        );
+        return disambiguateItems(next);
+      });
+    } catch (err) {
+      setFileItems((prev) =>
+        prev.map((it) =>
+          it.id === id
+            ? {
+              ...it,
+              busy: false,
+              error: err instanceof Error ? err.message : "Failed to compress image.",
+            }
+            : it
+        )
+      );
+    }
+  };
+
+  const compressAll = async () => {
+    const current = fileItemsRef.current;
+    if (current.length === 0) return;
+    setBusy(true);
+    setZipError(null);
+
+    setFileItems((prev) =>
+      prev.map((it) => ({ ...it, busy: true, error: undefined }))
+    );
+
+    try {
+      const batchInputs: BatchItemInput[] = current.map((it) => ({
+        file: it.file,
+        options: {
+          format: it.format,
+          quality: it.quality / 100,
+          pngLevel: it.pngLevel,
+        },
+        originalFilename: it.file.name,
+        id: it.id,
+      }));
+
+      const results = await compressBatch(batchInputs);
+
+      setFileItems((prev) => {
+        const next = prev.map((it, idx) => {
+          const res = results[idx];
+          if (it.compressedUrl) {
+            URL.revokeObjectURL(it.compressedUrl);
+          }
+
+          if (!res || !isCompressedItem(res)) {
+            return {
+              ...it,
+              busy: false,
+              error: res?.error || "Failed to compress image.",
+            };
+          }
+
+          const compressedUrl = URL.createObjectURL(res.blob);
+          const { savedBytes, percentReduction, isSmaller } = calculateSavings(
+            res.originalSize,
+            res.compressedSize
+          );
+
+          const processed: ProcessedItem = {
+            ...res,
+            originalUrl: it.originalUrl,
+            compressedUrl,
+            savedBytes,
+            percentReduction,
+            isSmaller,
+          };
+
+          return {
+            ...it,
+            busy: false,
+            compressedUrl,
+            output: processed,
+            error: undefined,
+          };
+        });
+
+        return disambiguateItems(next);
+      });
+    } catch (err) {
+      setZipError(err instanceof Error ? err.message : "Batch compression failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const successfulOutputs = fileItems
+    .map((it) => it.output)
+    .filter((out): out is ProcessedItem => Boolean(out));
+
+  const handleDownloadZip = async () => {
+    if (successfulOutputs.length === 0) return;
+    setZipping(true);
+    setZipError(null);
+    try {
+      const zipBlob = await createZipArchive(successfulOutputs);
+      downloadBlob(zipBlob, "compressed-images.zip");
+    } catch (err) {
+      setZipError(err instanceof Error ? err.message : "Could not create ZIP archive.");
+    } finally {
+      setZipping(false);
+    }
+  };
+
+  const totalSaved = successfulOutputs.reduce((acc, it) => acc + it.savedBytes, 0);
+  const totalOriginal = successfulOutputs.reduce((acc, it) => acc + it.originalSize, 0);
+  const overallPercent = totalOriginal > 0 ? Math.round((totalSaved / totalOriginal) * 100) : 0;
+  const failureCount = fileItems.filter((it) => Boolean(it.error)).length;
+
   return (
     <Panel>
-      <Dropzone accept="image/jpeg,image/png,image/webp" multiple label="Drop JPG, PNG or WebP images" onFiles={(f) => { setFiles(f); setOut([]); }}
-        sample={{ label: "Try a sample photo", busy: sampling, onPick: async () => { setSampling(true); const f = await loadSample("photo"); setFiles([f]); setOut([]); setSampling(false); } }} />
-      {files.length > 0 && (
-        <div className="grid gap-4 md:grid-cols-3">
-          <Field label={`Quality: ${quality}%`}><input type="range" min={10} max={95} value={quality} onChange={(e) => setQuality(+e.target.value)} className={rangeCls} /></Field>
-          <Field label="Output format">
-            <select className={inputCls} value={format} onChange={(e) => setFormat(e.target.value)}>
-              <option value="image/webp">WebP (smallest)</option><option value="image/jpeg">JPG</option>
-            </select>
-          </Field>
-          <div className="flex items-end"><Btn busy={busy} onClick={run}>Compress {files.length} image{files.length > 1 ? "s" : ""}</Btn></div>
+      <Dropzone
+        accept="image/jpeg,image/png,image/webp"
+        multiple
+        label="Drop JPG, PNG or WebP images"
+        onFiles={handleFiles}
+        sample={{
+          label: "Try a sample photo",
+          busy: sampling,
+          onPick: async () => {
+            setSampling(true);
+            const f = await loadSample("photo");
+            handleFiles([f]);
+            setSampling(false);
+          },
+        }}
+      />
+
+      {fileItems.length > 0 && (
+        <div className="rounded-2xl border border-[#D6CCB5] bg-[#FAF7F0] p-4 text-[#000000]">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-[#D6CCB5]/60 pb-2">
+            <div>
+              <p className="text-xs font-bold tracking-wider text-[#4A4740] uppercase">
+                Batch Defaults ({fileItems.length} image{fileItems.length > 1 ? "s" : ""})
+              </p>
+              <p className="text-xs text-[#4A4740]">
+                Configure global defaults or customize each image individually below.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={applyGlobalToAll}
+                className="btn-ghost text-xs cursor-pointer rounded-xl border border-[#D6CCB5] bg-[#FFFFFF] px-3 py-1.5 font-medium hover:border-[#7895B2]"
+              >
+                Apply to all images
+              </button>
+              <Btn busy={busy} onClick={compressAll}>
+                Compress all ({fileItems.length})
+              </Btn>
+            </div>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field
+              label="Default format"
+              hint={
+                globalFormat === "image/jpeg"
+                  ? "JPG fills transparent areas with opaque white"
+                  : globalFormat === "image/png"
+                    ? "PNG uses lossless optimization"
+                    : "WebP provides optimal lossy compression"
+              }
+            >
+              <select
+                className={inputCls}
+                value={globalFormat}
+                onChange={(e) => setGlobalFormat(e.target.value as CompressionFormat)}
+              >
+                <option value="image/webp">WebP (recommended / smallest)</option>
+                <option value="image/jpeg">JPG</option>
+                <option value="image/png">PNG (lossless)</option>
+              </select>
+            </Field>
+
+            {globalFormat === "image/png" ? (
+              <Field
+                label="PNG Lossless Optimization"
+                hint="Preserves 100% pixel detail and transparency"
+              >
+                <select
+                  className={inputCls}
+                  value={globalPngLevel}
+                  onChange={(e) => setGlobalPngLevel(e.target.value as PngOptimizationLevel)}
+                >
+                  <option value="default">Default (balanced adaptive filtering)</option>
+                  <option value="maximum">Maximum (5-filter + alpha reduction)</option>
+                  <option value="fast">Fast (basic filtering)</option>
+                </select>
+              </Field>
+            ) : (
+              <Field
+                label={`Default Quality: ${globalQuality}%`}
+                hint="Lower quality yields smaller file size"
+              >
+                <input
+                  type="range"
+                  min={10}
+                  max={95}
+                  value={globalQuality}
+                  onChange={(e) => setGlobalQuality(+e.target.value)}
+                  className={rangeCls}
+                />
+              </Field>
+            )}
+          </div>
         </div>
       )}
-      {out.length > 0 && (
+
+      {fileItems.length > 0 && (
         <>
-          <p className="rounded-2xl border border-[#D6CCB5] bg-[#FAF7F0] px-4 py-3 text-sm font-semibold tabular-nums text-[#000000]">
-            Saved {fmtBytes(Math.max(0, saved))} across {out.length} image{out.length > 1 ? "s" : ""}.
-          </p>
+          {successfulOutputs.length > 0 && (
+            <p className="rounded-2xl border border-[#D6CCB5] bg-[#FAF7F0] px-4 py-3 text-sm font-semibold tabular-nums text-[#000000]">
+              Saved {fmtBytes(totalSaved)} ({overallPercent}% smaller) across {successfulOutputs.length} image{successfulOutputs.length > 1 ? "s" : ""}.
+            </p>
+          )}
+
+          {failureCount > 0 && (
+            <p className="rounded-2xl border border-[#D95338]/30 bg-[#D95338]/10 px-4 py-2.5 text-xs font-medium text-[#9F2D18]">
+              {failureCount} file{failureCount > 1 ? "s" : ""} encountered an error. You can adjust settings and retry.
+            </p>
+          )}
+
           <div className="grid gap-3">
-            {out.map((o) => (
-              <div key={o.name} className="flex flex-wrap items-center gap-4 rounded-2xl border border-[#D6CCB5] bg-[#FAF7F0] p-3.5">
-                <img src={o.url} alt="" width={64} height={64} className="h-16 w-16 shrink-0 rounded-xl border border-[#D6CCB5] bg-[#FFFFFF] object-cover" />
-                <div className="min-w-0 flex-1 text-sm">
-                  <p className="truncate font-semibold text-[#000000]">{o.name}</p>
-                  <p className="mt-0.5 tabular-nums text-[#4A4740]">
-                    {fmtBytes(o.before)} → <b className="text-[#000000]">{fmtBytes(o.blob.size)}</b> ({Math.round((1 - o.blob.size / o.before) * 100)}% smaller)
-                  </p>
+            {fileItems.map((item) => (
+              <div
+                key={item.id}
+                data-testid="compressor-card"
+                className={`rounded-2xl border p-4 transition-colors ${item.error
+                  ? "border-[#D95338]/30 bg-[#D95338]/10 text-[#9F2D18]"
+                  : "border-[#D6CCB5] bg-[#FAF7F0] text-[#000000]"
+                  }`}
+              >
+                {/* Individual Settings Header */}
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-3 border-b border-[#D6CCB5]/40 pb-2.5">
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate font-semibold text-sm text-[#000000]">{item.file.name}</p>
+                    <p className="text-xs text-[#4A4740]">
+                      Original: {fmtBytes(item.file.size)}
+                    </p>
+                  </div>
+
+                  {/* Individual Image Controls */}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      className="rounded-xl border border-[#D6CCB5] bg-[#FFFFFF] px-2.5 py-1 text-xs font-medium text-[#000000]"
+                      value={item.format}
+                      onChange={(e) =>
+                        updateItemConfig(item.id, {
+                          format: e.target.value as CompressionFormat,
+                        })
+                      }
+                    >
+                      <option value="image/webp">WebP</option>
+                      <option value="image/jpeg">JPG</option>
+                      <option value="image/png">PNG</option>
+                    </select>
+
+                    {item.format === "image/png" ? (
+                      <select
+                        className="rounded-xl border border-[#D6CCB5] bg-[#FFFFFF] px-2.5 py-1 text-xs text-[#000000]"
+                        value={item.pngLevel}
+                        onChange={(e) =>
+                          updateItemConfig(item.id, {
+                            pngLevel: e.target.value as PngOptimizationLevel,
+                          })
+                        }
+                      >
+                        <option value="default">Default</option>
+                        <option value="maximum">Maximum</option>
+                        <option value="fast">Fast</option>
+                      </select>
+                    ) : (
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="range"
+                          min={10}
+                          max={95}
+                          value={item.quality}
+                          onChange={(e) =>
+                            updateItemConfig(item.id, { quality: +e.target.value })
+                          }
+                          className="h-1.5 w-20 cursor-pointer accent-[#000000]"
+                        />
+                        <span className="w-8 text-right text-xs tabular-nums text-[#4A4740]">
+                          {item.quality}%
+                        </span>
+                      </div>
+                    )}
+
+                    <Btn
+                      variant="ghost"
+                      busy={item.busy}
+                      onClick={() => compressSingle(item.id)}
+                    >
+                      {item.output ? "Recompress" : "Compress"}
+                    </Btn>
+                  </div>
                 </div>
-                <DownloadBtn onClick={() => downloadBlob(o.blob, o.name)} />
+
+                {/* Error Card */}
+                {item.error ? (
+                  <div className="flex items-center gap-3 text-sm">
+                    <AlertTriangle className="h-5 w-5 shrink-0 text-[#9F2D18]" aria-hidden="true" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs text-[#9F2D18]">{item.error}</p>
+                    </div>
+                  </div>
+                ) : item.output ? (
+                  /* Comparison & Result Card */
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+                    <div className="flex items-center gap-3">
+                      <div className="flex flex-col items-center">
+                        <span className="text-[10px] font-bold tracking-wider text-[#4A4740] uppercase">
+                          Original
+                        </span>
+                        {item.originalUrl ? (
+                          <img
+                            src={item.originalUrl}
+                            alt={`Original ${item.file.name}`}
+                            width={64}
+                            height={64}
+                            className="h-16 w-16 rounded-xl border border-[#D6CCB5] bg-[#FFFFFF] object-cover"
+                          />
+                        ) : (
+                          <div className="flex h-16 w-16 items-center justify-center rounded-xl border border-[#D6CCB5] bg-[#FFFFFF] text-xs text-[#4A4740]">
+                            N/A
+                          </div>
+                        )}
+                        <span className="mt-1 text-xs tabular-nums text-[#4A4740]">
+                          {fmtBytes(item.output.originalSize)}
+                        </span>
+                      </div>
+
+                      <ArrowRight className="h-4 w-4 shrink-0 text-[#4A4740]" aria-hidden="true" />
+
+                      <div className="flex flex-col items-center">
+                        <span className="text-[10px] font-bold tracking-wider text-[#4A4740] uppercase">
+                          Compressed
+                        </span>
+                        <img
+                          src={item.output.compressedUrl}
+                          alt={`Compressed ${item.output.name}`}
+                          width={64}
+                          height={64}
+                          className="h-16 w-16 rounded-xl border border-[#D6CCB5] bg-[#FFFFFF] object-cover"
+                        />
+                        <span className="mt-1 text-xs font-semibold tabular-nums text-[#000000]">
+                          {fmtBytes(item.output.compressedSize)}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="min-w-0 flex-1 text-sm">
+                      <p data-testid="compressed-name" className="truncate font-semibold text-[#000000]">{item.output.name}</p>
+                      <p className="mt-0.5 text-xs text-[#4A4740]">
+                        {item.output.width} × {item.output.height} px · {extFor(item.output.format).toUpperCase()}
+                      </p>
+                      <p className="mt-1 text-xs tabular-nums">
+                        {item.output.isSmaller ? (
+                          <span className="font-semibold text-[#000000]">
+                            {item.output.percentReduction}% smaller (saved {fmtBytes(item.output.savedBytes)})
+                          </span>
+                        ) : (
+                          <span className="text-[#4A4740]">
+                            No reduction ({fmtBytes(item.output.compressedSize - item.output.originalSize)} larger)
+                            {item.output.format === "image/png" && (
+                              <span className="ml-1 text-[11px] text-[#4A4740]">
+                                (Lossless PNG preserves 100% pixel data)
+                              </span>
+                            )}
+                          </span>
+                        )}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center self-end sm:self-center">
+                      <DownloadBtn onClick={() => downloadBlob(item.output!.blob, item.output!.name)} />
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>
+
+          {successfulOutputs.length > 1 && (
+            <div>
+              <Btn onClick={handleDownloadZip} busy={zipping}>
+                <Download className="h-4 w-4" aria-hidden="true" />
+                Download all as ZIP ({successfulOutputs.length} images)
+              </Btn>
+            </div>
+          )}
+
+          <ErrorNote msg={zipError} />
         </>
       )}
     </Panel>
@@ -185,85 +691,83 @@ export function ImageResizer() {
           <PresetPicker w={w} h={h} kb={kb} onPick={(p) => { setW(p.w); setH(p.h); setKb(p.kb ?? ""); setLock(false); }} />
           <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
 
-          <div className="grid content-start gap-3">
-            <div className="grid-dots flex min-h-64 items-center justify-center rounded-2xl border border-[#D6CCB5] bg-[#FAF7F0] p-4">
-              {out ? <img src={out.url} alt="Preview" className="max-h-96 max-w-full rounded-lg border border-[#D6CCB5] shadow-sm" /> : <div className="h-40 w-40 rounded-lg bg-[#E8DFCA]" />}
-            </div>
-            <div
-              aria-live="polite"
-              className={`rounded-2xl border p-4 text-sm ${
-                out && !out.hits
+            <div className="grid content-start gap-3">
+              <div className="grid-dots flex min-h-64 items-center justify-center rounded-2xl border border-[#D6CCB5] bg-[#FAF7F0] p-4">
+                {out ? <img src={out.url} alt="Preview" className="max-h-96 max-w-full rounded-lg border border-[#D6CCB5] shadow-sm" /> : <div className="h-40 w-40 rounded-lg bg-[#E8DFCA]" />}
+              </div>
+              <div
+                aria-live="polite"
+                className={`rounded-2xl border p-4 text-sm ${out && !out.hits
                   ? "border-[#D95338]/35 bg-[#D95338]/10 text-[#9F2D18]"
                   : "border-[#D6CCB5] bg-[#FAF7F0] text-[#000000]"
-              }`}
-            >
-              {busy ? (
-                <p className="flex items-center gap-2 font-semibold text-[#000000]"><Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> Matching your target size…</p>
-              ) : out ? (
-                <>
-                  <p className="flex flex-wrap items-center gap-2 font-semibold tabular-nums">
-                    {out.hits ? <Check className="h-4 w-4 text-[#000000]" aria-hidden="true" /> : <AlertTriangle className="h-4 w-4 text-[#9F2D18]" aria-hidden="true" />}
-                    {fmtBytes(out.blob.size)}
-                    {target ? (out.hits ? <span className="text-[#4A4740]">— under your {kb} KB target</span> : <span className="text-[#9F2D18]">— still above your {kb} KB target</span>) : <span className="text-[#4A4740]">— no target set</span>}
-                  </p>
-                  <p className={`mt-1 tabular-nums ${!out.hits ? "text-[#9F2D18]" : "text-[#4A4740]"}`}>
-                    Quality {Math.round(out.q * 100)}%
-                    {out.scale < 1 ? ` · output ${Math.round(w * out.scale)}×${Math.round(h * out.scale)} px to fit the target` : target ? " · full size kept" : ""}
-                    {out.q < 0.25 ? " · it will look soft — a looser target stays sharper" : ""}
-                    {target && !out.hits ? " · try a smaller width/height or a looser target" : ""}
-                  </p>
-                </>
-              ) : null}
+                  }`}
+              >
+                {busy ? (
+                  <p className="flex items-center gap-2 font-semibold text-[#000000]"><Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> Matching your target size…</p>
+                ) : out ? (
+                  <>
+                    <p className="flex flex-wrap items-center gap-2 font-semibold tabular-nums">
+                      {out.hits ? <Check className="h-4 w-4 text-[#000000]" aria-hidden="true" /> : <AlertTriangle className="h-4 w-4 text-[#9F2D18]" aria-hidden="true" />}
+                      {fmtBytes(out.blob.size)}
+                      {target ? (out.hits ? <span className="text-[#4A4740]">— under your {kb} KB target</span> : <span className="text-[#9F2D18]">— still above your {kb} KB target</span>) : <span className="text-[#4A4740]">— no target set</span>}
+                    </p>
+                    <p className={`mt-1 tabular-nums ${!out.hits ? "text-[#9F2D18]" : "text-[#4A4740]"}`}>
+                      Quality {Math.round(out.q * 100)}%
+                      {out.scale < 1 ? ` · output ${Math.round(w * out.scale)}×${Math.round(h * out.scale)} px to fit the target` : target ? " · full size kept" : ""}
+                      {out.q < 0.25 ? " · it will look soft — a looser target stays sharper" : ""}
+                      {target && !out.hits ? " · try a smaller width/height or a looser target" : ""}
+                    </p>
+                  </>
+                ) : null}
+              </div>
             </div>
-          </div>
-          <div className="grid content-start gap-4">
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Width px"><input className={inputCls} type="number" value={w} onChange={(e) => { const v = +e.target.value; setW(v); if (lock) setH(Math.round(v / ratio)); }} /></Field>
-              <Field label="Height px"><input className={inputCls} type="number" value={h} onChange={(e) => { const v = +e.target.value; setH(v); if (lock) setW(Math.round(v * ratio)); }} /></Field>
-            </div>
-            <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-[#000000]"><input type="checkbox" checked={lock} onChange={(e) => setLock(e.target.checked)} className="accent-[#000000]" /> Lock aspect ratio</label>
-            <Field label="Fit">
-              <select className={inputCls} value={fit} onChange={(e) => setFit(e.target.value as typeof fit)}>
-                <option value="cover">Crop to fill</option><option value="contain">Fit inside (white bars)</option><option value="stretch">Stretch</option>
-              </select>
-            </Field>
-            <Field label="Target file size (KB)" hint="Tell us the portal's limit — we tune quality, then pixels, to land under it.">
-              <div className="grid gap-2">
-                <input className={inputCls} type="number" min={1} value={kb} onChange={(e) => setKb(e.target.value ? +e.target.value : "")} placeholder="e.g. 20" />
-                <div className="flex flex-wrap gap-1.5">
-                  {[10, 20, 50, 100, 200].map((v) => (
-                    <button
-                      key={v}
-                      type="button"
-                      aria-pressed={kb === v}
-                      onClick={() => setKb(v)}
-                      className={`cursor-pointer rounded-full border px-3 py-1 text-xs font-semibold tabular-nums transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-                        kb === v
+            <div className="grid content-start gap-4">
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Width px"><input className={inputCls} type="number" value={w} onChange={(e) => { const v = +e.target.value; setW(v); if (lock) setH(Math.round(v / ratio)); }} /></Field>
+                <Field label="Height px"><input className={inputCls} type="number" value={h} onChange={(e) => { const v = +e.target.value; setH(v); if (lock) setW(Math.round(v * ratio)); }} /></Field>
+              </div>
+              <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-[#000000]"><input type="checkbox" checked={lock} onChange={(e) => setLock(e.target.checked)} className="accent-[#000000]" /> Lock aspect ratio</label>
+              <Field label="Fit">
+                <select className={inputCls} value={fit} onChange={(e) => setFit(e.target.value as typeof fit)}>
+                  <option value="cover">Crop to fill</option><option value="contain">Fit inside (white bars)</option><option value="stretch">Stretch</option>
+                </select>
+              </Field>
+              <Field label="Target file size (KB)" hint="Tell us the portal's limit — we tune quality, then pixels, to land under it.">
+                <div className="grid gap-2">
+                  <input className={inputCls} type="number" min={1} value={kb} onChange={(e) => setKb(e.target.value ? +e.target.value : "")} placeholder="e.g. 20" />
+                  <div className="flex flex-wrap gap-1.5">
+                    {[10, 20, 50, 100, 200].map((v) => (
+                      <button
+                        key={v}
+                        type="button"
+                        aria-pressed={kb === v}
+                        onClick={() => setKb(v)}
+                        className={`cursor-pointer rounded-full border px-3 py-1 text-xs font-semibold tabular-nums transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${kb === v
                           ? "border-[#000000] bg-[#000000] text-[#FFFFFF]"
                           : "border-[#D6CCB5] bg-[#FAF7F0] text-[#4A4740] hover:border-[#7895B2] hover:bg-[#FFFFFF] hover:text-[#000000]"
-                      }`}
-                    >
-                      ≤ {v} KB
-                    </button>
-                  ))}
-                  {kb !== "" && (
-                    <button
-                      type="button"
-                      onClick={() => setKb("")}
-                      className="cursor-pointer rounded-full border border-[#D6CCB5] bg-[#FFFFFF] px-3 py-1 text-xs font-semibold text-[#4A4740] transition-colors hover:border-[#000000]/40 hover:text-[#000000] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2]"
-                    >
-                      No target
-                    </button>
-                  )}
+                          }`}
+                      >
+                        ≤ {v} KB
+                      </button>
+                    ))}
+                    {kb !== "" && (
+                      <button
+                        type="button"
+                        onClick={() => setKb("")}
+                        className="cursor-pointer rounded-full border border-[#D6CCB5] bg-[#FFFFFF] px-3 py-1 text-xs font-semibold text-[#4A4740] transition-colors hover:border-[#000000]/40 hover:text-[#000000] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2]"
+                      >
+                        No target
+                      </button>
+                    )}
+                  </div>
                 </div>
+              </Field>
+              <div className="flex flex-wrap gap-2">
+                <DownloadBtn onClick={() => out && downloadBlob(out.blob, `${name}-${w}x${h}.jpg`)}>Download {out ? fmtBytes(out.blob.size) : ""}</DownloadBtn>
+                <Btn variant="ghost" onClick={() => setImg(null)}>New image</Btn>
               </div>
-            </Field>
-            <div className="flex flex-wrap gap-2">
-              <DownloadBtn onClick={() => out && downloadBlob(out.blob, `${name}-${w}x${h}.jpg`)}>Download {out ? fmtBytes(out.blob.size) : ""}</DownloadBtn>
-              <Btn variant="ghost" onClick={() => setImg(null)}>New image</Btn>
             </div>
           </div>
-        </div>
         </>
       )}
 
@@ -315,11 +819,10 @@ export function FormatConverter() {
                   type="button"
                   aria-pressed={to === m}
                   onClick={() => setTo(m)}
-                  className={`cursor-pointer rounded-full border px-4 py-2 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-                    to === m
-                      ? "border-[#000000] bg-[#000000] text-[#FFFFFF]"
-                      : "border-[#D6CCB5] bg-[#FAF7F0] text-[#4A4740] hover:border-[#7895B2] hover:bg-[#FFFFFF] hover:text-[#000000]"
-                  }`}
+                  className={`cursor-pointer rounded-full border px-4 py-2 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${to === m
+                    ? "border-[#000000] bg-[#000000] text-[#FFFFFF]"
+                    : "border-[#D6CCB5] bg-[#FAF7F0] text-[#4A4740] hover:border-[#7895B2] hover:bg-[#FFFFFF] hover:text-[#000000]"
+                    }`}
                 >
                   {extFor(m).toUpperCase()}
                 </button>
@@ -392,7 +895,7 @@ const QR_CORNERS: { id: QrCorner; label: string }[] = [
   { id: "circle", label: "Circle" },
   { id: "leaf", label: "Leaf" },
 ];
-const THUMB = [1,1,0,1,0, 0,1,1,1,1, 1,0,1,0,1, 1,1,1,0,0, 0,1,0,1,1];
+const THUMB = [1, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 1];
 function ShapeThumb({ shape }: { shape: QrShape }) {
   const ref = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
@@ -457,10 +960,10 @@ export function QrGenerator() {
 
   const value =
     type === "wifi" ? `WIFI:T:${enc};S:${ssid};P:${pass};;`
-    : type === "email" ? `mailto:${mailTo}?subject=${encodeURIComponent(mailSub)}&body=${encodeURIComponent(mailBody)}`
-    : type === "phone" ? `tel:${phone.replace(/[^+\d]/g, "")}`
-    : type === "vcard" ? ["BEGIN:VCARD", "VERSION:3.0", `FN:${vName}`, vOrg && `ORG:${vOrg}`, vTel && `TEL:${vTel}`, vMail && `EMAIL:${vMail}`, vUrl && `URL:${vUrl}`, "END:VCARD"].filter(Boolean).join("\n")
-    : text;
+      : type === "email" ? `mailto:${mailTo}?subject=${encodeURIComponent(mailSub)}&body=${encodeURIComponent(mailBody)}`
+        : type === "phone" ? `tel:${phone.replace(/[^+\d]/g, "")}`
+          : type === "vcard" ? ["BEGIN:VCARD", "VERSION:3.0", `FN:${vName}`, vOrg && `ORG:${vOrg}`, vTel && `TEL:${vTel}`, vMail && `EMAIL:${vMail}`, vUrl && `URL:${vUrl}`, "END:VCARD"].filter(Boolean).join("\n")
+            : text;
   const plainSvg = shape === "square" && corner === "square" && frame === "none" && !logo;
 
   useEffect(() => {
@@ -482,11 +985,10 @@ export function QrGenerator() {
             type="button"
             aria-pressed={type === id}
             onClick={() => setType(id)}
-            className={`inline-flex cursor-pointer items-center gap-2 rounded-xl border px-3.5 py-2 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-              type === id
-                ? "border-[#000000] bg-[#E8DFCA]/60 text-[#000000]"
-                : "border-[#D6CCB5] bg-[#FAF7F0] text-[#4A4740] hover:border-[#7895B2] hover:bg-[#FFFFFF] hover:text-[#000000]"
-            }`}
+            className={`inline-flex cursor-pointer items-center gap-2 rounded-xl border px-3.5 py-2 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${type === id
+              ? "border-[#000000] bg-[#E8DFCA]/60 text-[#000000]"
+              : "border-[#D6CCB5] bg-[#FAF7F0] text-[#4A4740] hover:border-[#7895B2] hover:bg-[#FFFFFF] hover:text-[#000000]"
+              }`}
           >
             <span className={`grid h-7 w-7 place-items-center rounded-lg ${type === id ? "bg-[#000000] text-[#FFFFFF]" : "border border-[#D6CCB5] bg-[#FFFFFF] text-[#000000]"}`}>
               <Icon className="h-4 w-4" aria-hidden="true" />
@@ -504,11 +1006,10 @@ export function QrGenerator() {
             type="button"
             aria-pressed={mode === m}
             onClick={() => setMode(m)}
-            className={`inline-flex cursor-pointer items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-              mode === m
-                ? "bg-[#000000] text-[#FFFFFF] shadow-xs"
-                : "text-[#4A4740] hover:text-[#000000]"
-            }`}
+            className={`inline-flex cursor-pointer items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${mode === m
+              ? "bg-[#000000] text-[#FFFFFF] shadow-xs"
+              : "text-[#4A4740] hover:text-[#000000]"
+              }`}
           >
             <Icon className="h-4 w-4" aria-hidden="true" />{label}
           </button>
@@ -520,224 +1021,217 @@ export function QrGenerator() {
       ) : mode === "collage" ? (
         <QrCollage value={value} fg={fg} bg={bg} shape={shape} corner={corner} logo={logo} />
       ) : (
-      <div className="grid gap-8 lg:grid-cols-[1fr_300px]">
-        <div className="grid content-start gap-7">
-          {/* step 1: content */}
-          <div className="grid gap-3">
-            <StepHead n={1} title="Complete the content" />
-            {type === "wifi" && (
-              <div className="grid gap-3 sm:grid-cols-3">
-                <Field label="Network name"><input className={inputCls} value={ssid} onChange={(e) => setSsid(e.target.value)} placeholder="MyHomeWifi" /></Field>
-                <Field label="Password"><input className={inputCls} value={pass} onChange={(e) => setPass(e.target.value)} /></Field>
-                <Field label="Security"><select className={inputCls} value={enc} onChange={(e) => setEnc(e.target.value)}><option>WPA</option><option>WEP</option><option value="nopass">None</option></select></Field>
-              </div>
-            )}
-            {type === "email" && (
-              <div className="grid gap-3">
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <Field label="Send to"><input className={inputCls} value={mailTo} onChange={(e) => setMailTo(e.target.value)} placeholder="hello@example.com" /></Field>
-                  <Field label="Subject"><input className={inputCls} value={mailSub} onChange={(e) => setMailSub(e.target.value)} /></Field>
+        <div className="grid gap-8 lg:grid-cols-[1fr_300px]">
+          <div className="grid content-start gap-7">
+            {/* step 1: content */}
+            <div className="grid gap-3">
+              <StepHead n={1} title="Complete the content" />
+              {type === "wifi" && (
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <Field label="Network name"><input className={inputCls} value={ssid} onChange={(e) => setSsid(e.target.value)} placeholder="MyHomeWifi" /></Field>
+                  <Field label="Password"><input className={inputCls} value={pass} onChange={(e) => setPass(e.target.value)} /></Field>
+                  <Field label="Security"><select className={inputCls} value={enc} onChange={(e) => setEnc(e.target.value)}><option>WPA</option><option>WEP</option><option value="nopass">None</option></select></Field>
                 </div>
-                <Field label="Message"><textarea rows={2} className={inputCls} value={mailBody} onChange={(e) => setMailBody(e.target.value)} /></Field>
-              </div>
-            )}
-            {type === "phone" && (
-              <Field label="Phone number" hint="Include the country code, e.g. +91 98765 43210"><input className={inputCls} value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+91 98765 43210" /></Field>
-            )}
-            {type === "vcard" && (
-              <div className="grid gap-3 sm:grid-cols-2">
-                <Field label="Full name"><input className={inputCls} value={vName} onChange={(e) => setVName(e.target.value)} placeholder="Asha Verma" /></Field>
-                <Field label="Company"><input className={inputCls} value={vOrg} onChange={(e) => setVOrg(e.target.value)} /></Field>
-                <Field label="Phone"><input className={inputCls} value={vTel} onChange={(e) => setVTel(e.target.value)} /></Field>
-                <Field label="Email"><input className={inputCls} value={vMail} onChange={(e) => setVMail(e.target.value)} /></Field>
-                <Field label="Website"><input className={inputCls} value={vUrl} onChange={(e) => setVUrl(e.target.value)} /></Field>
-              </div>
-            )}
-            {(type === "url" || type === "text") && (
-              <Field label={type === "url" ? "Enter your website" : "Enter your text"}>
-                <textarea rows={type === "url" ? 1 : 3} className={inputCls} value={text} onChange={(e) => setText(e.target.value)} placeholder={type === "url" ? "E.g. https://www.myweb.com/" : "Anything you like…"} />
-              </Field>
-            )}
-          </div>
-
-          {/* step 2: design */}
-          <div className="grid gap-4">
-            <StepHead n={2} title="Design your QR" />
-            <div className="flex w-fit flex-wrap gap-1 rounded-2xl border border-[#D6CCB5] bg-[#FAF7F0] p-1">
-              {(["frame", "shape", "logo", "level"] as const).map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  aria-pressed={designTab === t}
-                  onClick={() => setDesignTab(t)}
-                  className={`cursor-pointer rounded-xl px-4 py-2 text-sm font-semibold capitalize transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-                    designTab === t
-                      ? "bg-[#000000] text-[#FFFFFF] shadow-xs"
-                      : "text-[#4A4740] hover:text-[#000000]"
-                  }`}
-                >
-                  {t}
-                </button>
-              ))}
+              )}
+              {type === "email" && (
+                <div className="grid gap-3">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Field label="Send to"><input className={inputCls} value={mailTo} onChange={(e) => setMailTo(e.target.value)} placeholder="hello@example.com" /></Field>
+                    <Field label="Subject"><input className={inputCls} value={mailSub} onChange={(e) => setMailSub(e.target.value)} /></Field>
+                  </div>
+                  <Field label="Message"><textarea rows={2} className={inputCls} value={mailBody} onChange={(e) => setMailBody(e.target.value)} /></Field>
+                </div>
+              )}
+              {type === "phone" && (
+                <Field label="Phone number" hint="Include the country code, e.g. +91 98765 43210"><input className={inputCls} value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+91 98765 43210" /></Field>
+              )}
+              {type === "vcard" && (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field label="Full name"><input className={inputCls} value={vName} onChange={(e) => setVName(e.target.value)} placeholder="Asha Verma" /></Field>
+                  <Field label="Company"><input className={inputCls} value={vOrg} onChange={(e) => setVOrg(e.target.value)} /></Field>
+                  <Field label="Phone"><input className={inputCls} value={vTel} onChange={(e) => setVTel(e.target.value)} /></Field>
+                  <Field label="Email"><input className={inputCls} value={vMail} onChange={(e) => setVMail(e.target.value)} /></Field>
+                  <Field label="Website"><input className={inputCls} value={vUrl} onChange={(e) => setVUrl(e.target.value)} /></Field>
+                </div>
+              )}
+              {(type === "url" || type === "text") && (
+                <Field label={type === "url" ? "Enter your website" : "Enter your text"}>
+                  <textarea rows={type === "url" ? 1 : 3} className={inputCls} value={text} onChange={(e) => setText(e.target.value)} placeholder={type === "url" ? "E.g. https://www.myweb.com/" : "Anything you like…"} />
+                </Field>
+              )}
             </div>
 
-            {designTab === "frame" && (
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                {QR_FRAMES.map((f) => (
+            {/* step 2: design */}
+            <div className="grid gap-4">
+              <StepHead n={2} title="Design your QR" />
+              <div className="flex w-fit flex-wrap gap-1 rounded-2xl border border-[#D6CCB5] bg-[#FAF7F0] p-1">
+                {(["frame", "shape", "logo", "level"] as const).map((t) => (
                   <button
-                    key={f.id}
+                    key={t}
                     type="button"
-                    aria-pressed={frame === f.id}
-                    onClick={() => setFrame(f.id)}
-                    className={`grid cursor-pointer justify-items-center gap-1 rounded-2xl border p-3 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-                      frame === f.id
-                        ? "border-[#000000] bg-[#E8DFCA]/60"
-                        : "border-[#D6CCB5] bg-[#FAF7F0] hover:border-[#7895B2] hover:bg-[#FFFFFF]"
-                    }`}
+                    aria-pressed={designTab === t}
+                    onClick={() => setDesignTab(t)}
+                    className={`cursor-pointer rounded-xl px-4 py-2 text-sm font-semibold capitalize transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${designTab === t
+                      ? "bg-[#000000] text-[#FFFFFF] shadow-xs"
+                      : "text-[#4A4740] hover:text-[#000000]"
+                      }`}
                   >
-                    <FrameThumb id={f.id} fg={fg} />
-                    <span className="text-xs font-semibold text-[#000000]">{f.label}</span>
+                    {t}
                   </button>
                 ))}
               </div>
-            )}
 
-            {designTab === "shape" && (
-              <div className="grid gap-4">
-                <span className="text-sm font-semibold text-[#000000]">Dot style</span>
+              {designTab === "frame" && (
                 <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                  {QR_SHAPES.map((s) => (
+                  {QR_FRAMES.map((f) => (
                     <button
-                      key={s.id}
+                      key={f.id}
                       type="button"
-                      aria-pressed={shape === s.id}
-                      onClick={() => setShape(s.id)}
-                      className={`cursor-pointer rounded-2xl border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-                        shape === s.id
-                          ? "border-[#000000] bg-[#E8DFCA]/60"
-                          : "border-[#D6CCB5] bg-[#FAF7F0] hover:border-[#7895B2] hover:bg-[#FFFFFF]"
-                      }`}
-                    >
-                      <ShapeThumb shape={s.id} />
-                      <span className="block text-sm font-bold text-[#000000]">{s.label}</span>
-                      <span className="block text-xs text-[#4A4740]">{s.hint}</span>
-                    </button>
-                  ))}
-                </div>
-                <span className="text-sm font-semibold text-[#000000]">Corner eyes</span>
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                  {QR_CORNERS.map((k) => (
-                    <button
-                      key={k.id}
-                      type="button"
-                      aria-pressed={corner === k.id}
-                      onClick={() => setCorner(k.id)}
-                      className={`flex cursor-pointer flex-col items-center rounded-2xl border px-3 py-3 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-                        corner === k.id
-                          ? "border-[#000000] bg-[#E8DFCA]/60"
-                          : "border-[#D6CCB5] bg-[#FAF7F0] hover:border-[#7895B2] hover:bg-[#FFFFFF]"
-                      }`}
-                    >
-                      <CornerThumb corner={k.id} />
-                      <span className="text-sm font-bold text-[#000000]">{k.label}</span>
-                    </button>
-                  ))}
-                </div>
-                <div className="grid gap-3">
-                  <span className="text-sm font-semibold text-[#000000]">Code color</span>
-                  <div className="flex flex-wrap items-center gap-2">
-                    {QR_SWATCHES.map((c) => (
-                      <button
-                        key={c}
-                        type="button"
-                        aria-label={`Code color ${c}`}
-                        aria-pressed={fg === c}
-                        onClick={() => setFg(c)}
-                        className={`h-9 w-9 cursor-pointer rounded-full border-2 transition-transform focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-                          fg === c ? "scale-110 border-[#000000] ring-2 ring-[#7895B2]/50" : "border-[#D6CCB5] hover:scale-105"
+                      aria-pressed={frame === f.id}
+                      onClick={() => setFrame(f.id)}
+                      className={`grid cursor-pointer justify-items-center gap-1 rounded-2xl border p-3 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${frame === f.id
+                        ? "border-[#000000] bg-[#E8DFCA]/60"
+                        : "border-[#D6CCB5] bg-[#FAF7F0] hover:border-[#7895B2] hover:bg-[#FFFFFF]"
                         }`}
-                        style={{ background: c }}
-                      />
-                    ))}
-                    <input type="color" value={fg} onChange={(e) => setFg(e.target.value)} aria-label="Custom code color" className="h-9 w-12 cursor-pointer rounded-lg border border-[#D6CCB5]" />
-                  </div>
+                    >
+                      <FrameThumb id={f.id} fg={fg} />
+                      <span className="text-xs font-semibold text-[#000000]">{f.label}</span>
+                    </button>
+                  ))}
                 </div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <Field label="Background">
-                    <div className="flex items-center gap-2">
-                      {["#FFFFFF", "#FAF7F0", "#E8DFCA", "#111111"].map((c) => (
+              )}
+
+              {designTab === "shape" && (
+                <div className="grid gap-4">
+                  <span className="text-sm font-semibold text-[#000000]">Dot style</span>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                    {QR_SHAPES.map((s) => (
+                      <button
+                        key={s.id}
+                        type="button"
+                        aria-pressed={shape === s.id}
+                        onClick={() => setShape(s.id)}
+                        className={`cursor-pointer rounded-2xl border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${shape === s.id
+                          ? "border-[#000000] bg-[#E8DFCA]/60"
+                          : "border-[#D6CCB5] bg-[#FAF7F0] hover:border-[#7895B2] hover:bg-[#FFFFFF]"
+                          }`}
+                      >
+                        <ShapeThumb shape={s.id} />
+                        <span className="block text-sm font-bold text-[#000000]">{s.label}</span>
+                        <span className="block text-xs text-[#4A4740]">{s.hint}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <span className="text-sm font-semibold text-[#000000]">Corner eyes</span>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                    {QR_CORNERS.map((k) => (
+                      <button
+                        key={k.id}
+                        type="button"
+                        aria-pressed={corner === k.id}
+                        onClick={() => setCorner(k.id)}
+                        className={`flex cursor-pointer flex-col items-center rounded-2xl border px-3 py-3 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${corner === k.id
+                          ? "border-[#000000] bg-[#E8DFCA]/60"
+                          : "border-[#D6CCB5] bg-[#FAF7F0] hover:border-[#7895B2] hover:bg-[#FFFFFF]"
+                          }`}
+                      >
+                        <CornerThumb corner={k.id} />
+                        <span className="text-sm font-bold text-[#000000]">{k.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="grid gap-3">
+                    <span className="text-sm font-semibold text-[#000000]">Code color</span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {QR_SWATCHES.map((c) => (
                         <button
                           key={c}
                           type="button"
-                          aria-label={`Background ${c}`}
-                          aria-pressed={bg === c}
-                          onClick={() => setBg(c)}
-                          className={`h-9 w-9 cursor-pointer rounded-full border-2 transition-transform focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-                            bg === c ? "scale-110 border-[#000000] ring-2 ring-[#7895B2]/50" : "border-[#D6CCB5] hover:scale-105"
-                          }`}
+                          aria-label={`Code color ${c}`}
+                          aria-pressed={fg === c}
+                          onClick={() => setFg(c)}
+                          className={`h-9 w-9 cursor-pointer rounded-full border-2 transition-transform focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${fg === c ? "scale-110 border-[#000000] ring-2 ring-[#7895B2]/50" : "border-[#D6CCB5] hover:scale-105"
+                            }`}
                           style={{ background: c }}
                         />
                       ))}
-                      <input type="color" value={bg} onChange={(e) => setBg(e.target.value)} aria-label="Custom background color" className="h-9 w-12 cursor-pointer rounded-lg border border-[#D6CCB5]" />
+                      <input type="color" value={fg} onChange={(e) => setFg(e.target.value)} aria-label="Custom code color" className="h-9 w-12 cursor-pointer rounded-lg border border-[#D6CCB5]" />
                     </div>
-                  </Field>
-                  <Field label={`Size · ${size}px`}><input type="range" min={128} max={1024} step={32} value={size} onChange={(e) => setSize(+e.target.value)} className={rangeCls} /></Field>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Field label="Background">
+                      <div className="flex items-center gap-2">
+                        {["#FFFFFF", "#FAF7F0", "#E8DFCA", "#111111"].map((c) => (
+                          <button
+                            key={c}
+                            type="button"
+                            aria-label={`Background ${c}`}
+                            aria-pressed={bg === c}
+                            onClick={() => setBg(c)}
+                            className={`h-9 w-9 cursor-pointer rounded-full border-2 transition-transform focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${bg === c ? "scale-110 border-[#000000] ring-2 ring-[#7895B2]/50" : "border-[#D6CCB5] hover:scale-105"
+                              }`}
+                            style={{ background: c }}
+                          />
+                        ))}
+                        <input type="color" value={bg} onChange={(e) => setBg(e.target.value)} aria-label="Custom background color" className="h-9 w-12 cursor-pointer rounded-lg border border-[#D6CCB5]" />
+                      </div>
+                    </Field>
+                    <Field label={`Size · ${size}px`}><input type="range" min={128} max={1024} step={32} value={size} onChange={(e) => setSize(+e.target.value)} className={rangeCls} /></Field>
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
 
-            {designTab === "logo" && (
-              <div className="grid gap-3">
-                <div className="flex flex-wrap items-center gap-3">
-                  <Btn variant="ghost" onClick={() => logoInputRef.current?.click()}><Upload className="h-4 w-4" aria-hidden="true" />{logo ? "Change logo" : "Upload a logo"}</Btn>
-                  {logo && <Btn variant="ghost" onClick={() => setLogo(null)}><X className="h-4 w-4" aria-hidden="true" />Remove</Btn>}
-                  <input ref={logoInputRef} type="file" hidden accept="image/*"
-                    onChange={async (e) => { const f = e.target.files?.[0]; if (f) setLogo(await loadImage(f)); e.target.value = ""; }} />
+              {designTab === "logo" && (
+                <div className="grid gap-3">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <Btn variant="ghost" onClick={() => logoInputRef.current?.click()}><Upload className="h-4 w-4" aria-hidden="true" />{logo ? "Change logo" : "Upload a logo"}</Btn>
+                    {logo && <Btn variant="ghost" onClick={() => setLogo(null)}><X className="h-4 w-4" aria-hidden="true" />Remove</Btn>}
+                    <input ref={logoInputRef} type="file" hidden accept="image/*"
+                      onChange={async (e) => { const f = e.target.files?.[0]; if (f) setLogo(await loadImage(f)); e.target.value = ""; }} />
+                  </div>
+                  <p className="text-xs text-[#4A4740]">Your logo sits in the middle on a clean patch. We automatically switch to the strongest error correction (H) so the code keeps scanning.</p>
                 </div>
-                <p className="text-xs text-[#4A4740]">Your logo sits in the middle on a clean patch. We automatically switch to the strongest error correction (H) so the code keeps scanning.</p>
-              </div>
-            )}
+              )}
 
-            {designTab === "level" && (
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                {QR_LEVELS.map((l) => (
-                  <button
-                    key={l.id}
-                    type="button"
-                    aria-pressed={level === l.id}
-                    onClick={() => setLevel(l.id)}
-                    disabled={!!logo}
-                    className={`cursor-pointer rounded-xl border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] disabled:opacity-50 ${
-                      level === l.id
+              {designTab === "level" && (
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {QR_LEVELS.map((l) => (
+                    <button
+                      key={l.id}
+                      type="button"
+                      aria-pressed={level === l.id}
+                      onClick={() => setLevel(l.id)}
+                      disabled={!!logo}
+                      className={`cursor-pointer rounded-xl border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] disabled:opacity-50 ${level === l.id
                         ? "border-[#000000] bg-[#E8DFCA]/60"
                         : "border-[#D6CCB5] bg-[#FAF7F0] hover:border-[#7895B2] hover:bg-[#FFFFFF]"
-                    }`}
-                  >
-                    <span className="block text-sm font-bold text-[#000000]">{l.label}</span>
-                    <span className="block text-xs text-[#4A4740]">{l.hint}</span>
-                  </button>
-                ))}
-                {logo && <p className="col-span-full text-xs text-[#4A4740]">Locked to H while a logo is placed — remove the logo to change it.</p>}
-              </div>
-            )}
+                        }`}
+                    >
+                      <span className="block text-sm font-bold text-[#000000]">{l.label}</span>
+                      <span className="block text-xs text-[#4A4740]">{l.hint}</span>
+                    </button>
+                  ))}
+                  {logo && <p className="col-span-full text-xs text-[#4A4740]">Locked to H while a logo is placed — remove the logo to change it.</p>}
+                </div>
+              )}
+            </div>
           </div>
-        </div>
 
-        {/* step 3: download */}
-        <div className="grid content-start justify-items-center gap-4 rounded-3xl border border-[#D6CCB5] bg-[#FAF7F0] p-6">
-          <StepHead n={3} title="Download your QR" />
-          <div className="rounded-2xl border border-[#D6CCB5] bg-[#FFFFFF] p-4 shadow-sm">
-            <canvas ref={canvasRef} className="w-56 rounded-lg" aria-label="QR code preview" />
+          {/* step 3: download */}
+          <div className="grid content-start justify-items-center gap-4 rounded-3xl border border-[#D6CCB5] bg-[#FAF7F0] p-6">
+            <StepHead n={3} title="Download your QR" />
+            <div className="rounded-2xl border border-[#D6CCB5] bg-[#FFFFFF] p-4 shadow-sm">
+              <canvas ref={canvasRef} className="w-56 rounded-lg" aria-label="QR code preview" />
+            </div>
+            <div className="flex flex-wrap justify-center gap-2">
+              <DownloadBtn onClick={downloadPng}>PNG</DownloadBtn>
+              <Btn variant="ghost" onClick={() => { if (plainSvg) void downloadSvg(); }} disabled={!plainSvg}>SVG</Btn>
+            </div>
+            {!plainSvg && <p className="text-center text-xs text-[#4A4740]">SVG export is available for the classic square style without a frame or logo.</p>}
+            <p className="text-center text-xs text-[#4A4740]">Updates live as you type — scan it with your phone to test.</p>
+            <Btn variant="ghost" onClick={() => setMode("print")}><Printer className="h-4 w-4" aria-hidden="true" />Print this design</Btn>
           </div>
-          <div className="flex flex-wrap justify-center gap-2">
-            <DownloadBtn onClick={downloadPng}>PNG</DownloadBtn>
-            <Btn variant="ghost" onClick={() => { if (plainSvg) void downloadSvg(); }} disabled={!plainSvg}>SVG</Btn>
-          </div>
-          {!plainSvg && <p className="text-center text-xs text-[#4A4740]">SVG export is available for the classic square style without a frame or logo.</p>}
-          <p className="text-center text-xs text-[#4A4740]">Updates live as you type — scan it with your phone to test.</p>
-          <Btn variant="ghost" onClick={() => setMode("print")}><Printer className="h-4 w-4" aria-hidden="true" />Print this design</Btn>
         </div>
-      </div>
       )}
     </Panel>
   );
@@ -873,11 +1367,10 @@ export function PdfTool() {
             type="button"
             aria-pressed={mode === m}
             onClick={() => { setMode(m); setFiles([]); }}
-            className={`cursor-pointer rounded-full border px-4 py-2 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${
-              mode === m
-                ? "border-[#000000] bg-[#000000] text-[#FFFFFF]"
-                : "border-[#D6CCB5] bg-[#FAF7F0] text-[#4A4740] hover:border-[#7895B2] hover:bg-[#FFFFFF] hover:text-[#000000]"
-            }`}
+            className={`cursor-pointer rounded-full border px-4 py-2 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7895B2] ${mode === m
+              ? "border-[#000000] bg-[#000000] text-[#FFFFFF]"
+              : "border-[#D6CCB5] bg-[#FAF7F0] text-[#4A4740] hover:border-[#7895B2] hover:bg-[#FFFFFF] hover:text-[#000000]"
+              }`}
           >
             {m === "merge" ? "Merge PDFs" : "Split / extract pages"}
           </button>

@@ -13,17 +13,17 @@
 | **Local Route / Slug** | `/image-compressor` | `/image-resizer` | `/image-format-converter` | `/pdf-merger` |
 | **Reference Route** | *[Pending Reference Site]* | *[Pending Reference Site]* | *[Pending Reference Site]* | *[Pending Reference Site]* |
 | **Accepted Input Formats** | `image/jpeg`, `image/png`, `image/webp` (enforced via file dropzone and `decodeImage` MIME sniffer) | `image/*` (accepts JPEG, PNG, WebP via `decodeImage` sniffer) | `image/*` (accepts JPEG, PNG, WebP via `decodeImage` sniffer) | `application/pdf` |
-| **Libraries Used** | Native Canvas 2D, `createImageBitmap`, `@/lib/image` helpers | Native Canvas 2D, `@/lib/fit-size`, `@/lib/image` helpers | Native Canvas 2D, `jszip` (v3.10.2), `@/lib/image` helpers | `pdf-lib` (v1.17.1) |
-| **Shared Helpers Integrated** | `decodeImage`, `correctImageOrientation`, `canvasToBlob`, `downloadBlob` | `decodeImage`, `correctImageOrientation`, `canvasToBlob`, `downloadBlob` | `decodeImage`, `correctImageOrientation`, `canvasToBlob`, `downloadBlob` | N/A (Document tool; uses `pdf-lib` and `ui.tsx`) |
-| **Processing Architecture** | Client-side (in-browser Canvas and Promise-based ImageBitmap decoding) | Client-side (in-browser Canvas with binary search quality/scale fitting) | Client-side (in-browser Canvas and JSZip in-memory bundling) | Client-side (`pdf-lib` WebAssembly/pure JS document manipulation) |
-| **User Controls** | Quality slider (10% to 95%), Output format dropdown (`WebP`, `JPG`), Batch compress trigger | Width (px), Height (px), Lock aspect ratio toggle, Fit selector (`cover`, `contain`, `stretch`), Target file size (KB presets and custom input) | Format selector pills (`PNG`, `JPG`, `WEBP`), Batch convert trigger | Mode toggle (`Merge PDFs`, `Split / extract pages`), Move up/down buttons, Remove file buttons, Page range text input |
-| **Preview Capabilities** | Output thumbnail (64x64), original vs compressed byte size, percentage savings indicator | Live centered canvas preview (max-h-96), output byte size, target match status (`Check` / `AlertTriangle`), scale and quality indicators | Output thumbnail (48x48) per converted file, output byte size | Document list with page counts; no visual page content thumbnail rendering |
-| **Output Formats** | `image/webp` (`.webp`) or `image/jpeg` (`.jpg`) | `image/jpeg` (`.jpg`) | `image/png` (`.png`), `image/jpeg` (`.jpg`), `image/webp` (`.webp`) | `application/pdf` (`merged.pdf` or `extracted-pages.pdf`) |
-| **Batch Capabilities** | Yes (multiple file upload, batch compression in single loop, individual downloads) | Single image processing only | Yes (multiple file upload, batch conversion, individual download buttons and "Download all as ZIP") | Merge: Multiple file upload, sequential merging; Split: Single file upload, page range extraction |
-| **Transparency Handling** | WebP: transparency preserved; JPEG: flattened onto `#ffffff` background | Flattened onto `#ffffff` canvas background | PNG/WebP: transparency preserved; JPEG: flattened onto `#ffffff` with user UI notice | N/A |
+| **Libraries Used** | Native Canvas 2D, `createImageBitmap`, `jszip` (v3.10.2), `@/lib/image` helpers | Native Canvas 2D, `@/lib/fit-size`, `@/lib/image` helpers | Native Canvas 2D, `jszip` (v3.10.2), `@/lib/image` helpers | `pdf-lib` (v1.17.1) |
+| **Shared Helpers Integrated** | `decodeImage`, `correctImageOrientation`, `canvasToBlob`, `downloadBlob`, `compressBatch`, `createZipArchive`, `calculateSavings` | `decodeImage`, `correctImageOrientation`, `canvasToBlob`, `downloadBlob` | `decodeImage`, `correctImageOrientation`, `canvasToBlob`, `downloadBlob` | N/A (Document tool; uses `pdf-lib` and `ui.tsx`) |
+| **Processing Architecture** | Client-side (in-browser Canvas, Promise-based ImageBitmap decoding, in-memory JSZip archiving) | Client-side (in-browser Canvas with binary search quality/scale fitting) | Client-side (in-browser Canvas and JSZip in-memory bundling) | Client-side (`pdf-lib` WebAssembly/pure JS document manipulation) |
+| **User Controls** | Quality slider (10% to 95%, disabled/lossless for PNG), Output format selector (`WebP`, `JPG`, `PNG`), Batch compress trigger | Width (px), Height (px), Lock aspect ratio toggle, Fit selector (`cover`, `contain`, `stretch`), Target file size (KB presets and custom input) | Format selector pills (`PNG`, `JPG`, `WEBP`), Batch convert trigger | Mode toggle (`Merge PDFs`, `Split / extract pages`), Move up/down buttons, Remove file buttons, Page range text input |
+| **Preview Capabilities** | True before-and-after visual comparison (original thumbnail 64x64 vs compressed thumbnail 64x64 with arrow), dimensions, original vs compressed byte sizes, saved bytes, percentage reduction | Live centered canvas preview (max-h-96), output byte size, target match status (`Check` / `AlertTriangle`), scale and quality indicators | Output thumbnail (48x48) per converted file, output byte size | Document list with page counts; no visual page content thumbnail rendering |
+| **Output Formats** | `image/webp` (`.webp`), `image/jpeg` (`.jpg`), `image/png` (`.png`, lossless) | `image/jpeg` (`.jpg`) | `image/png` (`.png`), `image/jpeg` (`.jpg`), `image/webp` (`.webp`) | `application/pdf` (`merged.pdf` or `extracted-pages.pdf`) |
+| **Batch Capabilities** | Yes (multiple file upload, independent fault-tolerant compression, duplicate filename disambiguation, individual download buttons and "Download all as ZIP") | Single image processing only | Yes (multiple file upload, batch conversion, individual download buttons and "Download all as ZIP") | Merge: Multiple file upload, sequential merging; Split: Single file upload, page range extraction |
+| **Transparency Handling** | WebP & PNG: transparency preserved; JPEG: flattened onto `#ffffff` background with explicit UI notice | Flattened onto `#ffffff` canvas background | PNG/WebP: transparency preserved; JPEG: flattened onto `#ffffff` with user UI notice | N/A |
 | **Orientation Handling** | Auto-corrected via `correctImageOrientation` from EXIF tags on `ImageBitmap` | Auto-corrected via `correctImageOrientation`; canvas dimensions initialized to oriented size | Auto-corrected via `correctImageOrientation` from EXIF tags | Retains native page rotation dictionary via `pdf-lib` |
-| **Error Handling** | Rejects invalid image types and corrupted signatures with descriptive error; memory freed via `bitmap.close()` | Rejects invalid image signatures; rejects invalid backgroundColor values; memory freed in `finally` | Rejects unsupported types; safely cleans up object URLs on download failure | Displays inline alert note if file fails `PDFDocument.load` or invalid page range syntax is provided |
-| **Download Behavior** | Safe single download via `downloadBlob` (sanitizes filename, revokes object URL) | Safe single download via `downloadBlob` (`${name}-${w}x${h}.jpg`) | Single download via `downloadBlob`; multi-file ZIP download via `downloadBlob` (`converted-images.zip`) | Single download via `download()` (`merged.pdf` or `extracted-pages.pdf`) |
+| **Error Handling** | Per-file fault isolation (corrupt images display clear error note without aborting batch); memory freed via `bitmap.close()` | Rejects invalid image signatures; rejects invalid backgroundColor values; memory freed in `finally` | Rejects unsupported types; safely cleans up object URLs on download failure | Displays inline alert note if file fails `PDFDocument.load` or invalid page range syntax is provided |
+| **Download Behavior** | Safe single download via `downloadBlob` (sanitizes filename, revokes object URL); "Download all as ZIP" via `createZipArchive` | Safe single download via `downloadBlob` (`${name}-${w}x${h}.jpg`) | Single download via `downloadBlob`; multi-file ZIP download via `downloadBlob` (`converted-images.zip`) | Single download via `download()` (`merged.pdf` or `extracted-pages.pdf`) |
 
 ---
 
@@ -33,20 +33,33 @@
 - **Component**: `ImageCompressor` in [src/components/tools/ImageTools.tsx](file:///c:/Users/Lenovo/OneDrive/Documents/3rd%20year/marvedge-tools/src/components/tools/ImageTools.tsx)
 - **Primary Goal**: Compress raster images to reduce file size while allowing quality selection.
 
-### Existing Functionality Verified
+### Existing Functionality Verified (Part 2 Implementation Complete)
 - Accepts JPEG, PNG, and WebP via drag-and-drop or file picker.
 - Bundles quick sample loader (`loadSample("photo")`).
-- Quality slider ranges from 10% to 95% (default 70%).
-- Output format selector supports WebP and JPEG.
-- Displays savings summary (`Saved X KB across Y images`) and per-file cards with before/after byte count and reduction percentage.
-- Real browser test: 101.2 KB JPEG compressed to 45.9 KB WebP (55% smaller) at 70% quality, and 76.1 KB JPEG (25% smaller) at 50% quality.
+- Global Batch Defaults bar with format selector, default quality slider, and "Apply to all images" synchronization button.
+- Per-image independent configuration: each card in a batch has its own output format selector and quality/optimization controls.
+- Contextual quality controls: WebP and JPEG use the 10%–95% quality slider; PNG automatically switches to the lossless optimization level selector (`Default`, `Maximum`, `Fast`).
+- Lossless PNG optimization (`pngOptimizer.ts`):
+  - 100% opaque PNGs losslessly converted to 24-bit RGB (Color Type 2), verified on disk.
+  - Transparent PNGs maintain 32-bit RGBA (Color Type 6) with pixel-exact transparency and transparent pixel zeroing for maximum Deflate compression, verified on disk.
+  - Standard RFC 1950 zlib Deflate compression via native `CompressionStream("deflate")`.
+  - Transparent reporting when conversion yields no size reduction or increases byte size: `(Lossless PNG preserves 100% pixel data)`.
+- Before-and-after visual comparison: side-by-side original and compressed thumbnails with dimensions, byte counts, and reduction percentage.
+- Independent batch processing with per-file fault isolation (corrupt images display clear error notes without aborting the batch).
+- Duplicate filename disambiguation follows OS convention: `photo-compressed.ext`, `photo-compressed (2).ext`, `photo-compressed (3).ext`. Different file extensions are preserved without artificial suffix collisions.
+- Individual download buttons plus "Download all as ZIP" (via JSZip).
+- Real browser test: All 7 verification scenarios passed live in Chromium via CDP with disk-level inspection of downloaded files and extracted ZIP archives; 0 console errors or uncaught exceptions.
 
 ### Shared Helpers Integrated
 - `decodeImage(f)`: Validates magic byte signatures, rejects non-image inputs, and decodes via `createImageBitmap`.
 - `correctImageOrientation(bitmap)`: Standardizes EXIF orientation to prevent sideways or upside-down mobile photos.
-- `canvasToBlob(canvas, { type, quality, backgroundColor })`: Enforces opaque `#ffffff` background for JPEG and preserves alpha channel for WebP.
+- `canvasToBlob(canvas, { type, quality, backgroundColor })`: Enforces opaque `#ffffff` background for JPEG and preserves alpha channel for WebP/PNG.
 - `downloadBlob(blob, name)`: Guarantees object URL revocation and filename sanitization.
+- `optimizeCanvasToPng(canvas, level)`: Lossless PNG encoder and optimizer with adaptive scanline filtering and alpha reduction.
 - `bitmap.close()`: Wrapped in `try...finally` to immediately release GPU/RAM memory.
+- `compressBatch(files, options)`: Batch compression engine with progress reporting and fault tolerance.
+- `createZipArchive(items)`: Bundles compressed batch items into DEFLATE-compressed ZIP archives with unique entry names.
+- `calculateSavings(orig, comp)`: Computes saved bytes, percentage reduction, and size increase/decrease status.
 
 ### Limitations & Missing Functionality
 - Does not support AVIF or GIF output.
