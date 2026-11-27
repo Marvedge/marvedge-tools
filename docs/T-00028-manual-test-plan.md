@@ -83,7 +83,49 @@ Use real test photo fixtures taken on modern smartphones with EXIF orientations 
 
 ## 6. Automated Coverage Summary
 
-All unit test suites run via `pnpm test` (`tests/image-helpers.test.ts`), covering:
-- 67 automated test cases across 15 distinct functional and edge-case categories.
-- Strict TypeScript verification (`pnpm exec tsc --noEmit`).
-- Zero ESLint warnings (`pnpm lint`).
+All unit test suites run via `pnpm test`, covering:
+- **100 image-specific automated test cases**:
+  - 67 in `src/lib/image/__tests__/image-helpers.test.ts` (shared helpers).
+  - 10 in `src/lib/image/__tests__/pngOptimizer.test.ts` (lossless PNG optimizer, Color Type 2/6, scanline filters, fallbacks).
+  - 23 in `src/lib/image/__tests__/compressImage.test.ts` (compressor engine, per-image options, duplicate naming, fault isolation, ZIP creation).
+- **150 total repository test cases** across 12 test suites.
+- Strict TypeScript verification (`pnpm typecheck` / `tsc --noEmit`).
+- Zero ESLint errors (`pnpm lint`).
+- Full Next.js production build (`pnpm build`).
+
+---
+
+## 7. Image Compressor Manual & Integration Test Plan
+
+The Image Compressor tool page (`/image-compressor`) integrates the complete batch compression pipeline. Execute the following verification checklist:
+
+### A. Format & Quality Settings
+- [x] **Sample Image Loading**: Clicking "Try a sample photo" populates the compressor with the bundled sample image.
+- [x] **WebP Compression**: Selecting WebP at default 70% quality compresses the sample image, yielding a `.webp` file with significant byte savings.
+- [x] **Lossless PNG Optimization**:
+  - Selecting PNG switches the quality controls to the lossless optimization level selector (`Default`, `Maximum`, `Fast`).
+  - Opaque PNGs are losslessly converted to 24-bit RGB (Color Type 2), verified on disk.
+  - Transparent PNGs maintain 32-bit RGBA (Color Type 6) with pixel-exact transparency and zeroed transparent pixels, verified on disk.
+  - When optimization yields no size reduction or increases file size, UI displays transparent message `(Lossless PNG preserves 100% pixel data)`.
+- [x] **JPEG Transparency Warning**: Selecting JPEG displays the warning that transparent areas are flattened with an opaque white background (`#ffffff`), producing an opaque `.jpg` file.
+- [x] **Quality Slider Reactivity**: Adjusting the slider for lossy formats (JPEG/WebP) reactively updates the output size and metrics upon compression.
+
+### B. Visual Comparison & Metrics
+- [x] **Before-and-After Thumbnails**: Side-by-side display showing original thumbnail (with original dimensions and byte size) and compressed thumbnail (with compressed dimensions and byte size).
+- [x] **Reduction Metrics**: Display shows percentage reduction and exact saved byte count (or indicates if compressed file is larger).
+- [x] **Object URL Cleanup**: Verified that all created object URLs are cleanly revoked on recompression, file replacement, or component unmount.
+
+### C. Batch Processing & Fault Isolation
+- [x] **Multi-File Upload**: Selecting multiple files displays "Batch Defaults" bar and "Compress all (N)" button.
+- [x] **Per-Image Batch Settings**: Each file card features independent format, quality, and optimization controls. Settings can be edited per image without affecting other cards.
+- [x] **Apply to All Synchronization**: Clicking "Apply to all images" in the Batch Defaults bar propagates defaults to all images in the queue.
+- [x] **Independent Recompression**: Individual "Compress" / "Recompress" buttons allow recompressing single images with updated settings while preserving other card outputs.
+- [x] **Duplicate Filenames across Folders**: Uploading duplicate filenames (e.g. `folderA/photo.png`, `folderB/photo.png`, `folderC/photo.png`) disambiguates output names to `photo-compressed.png`, `photo-compressed (2).png`, `photo-compressed (3).png`.
+- [x] **Mixed Format Extension Preservation**: When duplicate base names use different output formats, extensions are preserved without artificial suffix collisions (e.g. `photo-compressed.webp`, `photo-compressed.jpg`).
+- [x] **Corrupt File Resilience**: Uploading a corrupted file alongside valid images renders an error note for the corrupted file (`Unsupported or invalid image content. Use JPEG, PNG, WebP, AVIF or BMP.`) while successfully compressing valid images.
+- [x] **Download All as ZIP**: When 2 or more files succeed, "Download all as ZIP (N images)" downloads a `.zip` archive. Extracted and verified on disk that:
+  - All valid images are present without overwriting.
+  - Filenames in the ZIP match individual download names 1:1.
+  - Corrupted files are excluded from the archive.
+- [x] **Individual Download**: Each individual card provides a functional download button verified by inspecting downloaded files on disk.
+- [x] **Console Verification**: Verified 0 console errors and 0 uncaught exceptions during live browser execution.

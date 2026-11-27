@@ -7,7 +7,8 @@ Task **T-00028** establishes the core foundation for Marvedge Tools client-side 
 1. **Audit Template for Four Reference Tools**: Image Compressor, Image Resizer and Cropper, Image Format Converter, and PDF Merger and Splitter. (Note: Reference values depend on the deployed website and Coda Tools Description PDF and are kept strictly marked as `Pending` to avoid inventing assumptions).
 2. **Library Research & Comparison**: Evaluating Native Canvas, `createImageBitmap()`, `browser-image-compression`, `Compressor.js`, `Pica`, and `pdf-lib`.
 3. **Shared Image Helpers**: Production-grade client-side utilities for decoding with format sniffing, orientation correction without double-rotation, canvas export with transparency flattening, and safe downloads.
-4. **Automated Unit Testing & Manual Browser Test Plan**: 67 unit tests verifying contracts, input validation, resource cleanup, and mock handling, alongside an explicit manual test plan for real physical fixtures in real browser engines.
+4. **Automated Unit Testing & Manual Browser Test Plan**: 67 unit tests verifying shared helper contracts, input validation, resource cleanup, and mock handling, alongside an explicit manual test plan for real physical fixtures in real browser engines.
+5. **Part 2 — Image Compressor**: Full batch image compression supporting WebP, JPG, and PNG with visual before-and-after comparison, duplicate filename disambiguation, fault-tolerant batching, individual and ZIP archive downloads, and 21 dedicated unit tests.
 
 ---
 
@@ -258,3 +259,55 @@ async function handleCompressImage(file: File) {
 2. **Header Dimension Pre-check Coverage**: Pre-decode dimension scanning covers PNG (IHDR), JPEG (SOF markers), WebP (VP8, VP8L, VP8X), and BMP (DIB). Certain fragmented ISO BMFF AVIF files may not expose `ispe` boxes in the initial 256 KB; in those cases, the pixel limit is checked immediately post-decode.
 3. **Mobile Canvas Size Limits**: Mobile browsers (especially iOS WebKit) impose canvas size limits (typically 4096 x 4096 or 16.7 megapixels). Tool UIs must downsample or handle canvas allocation limits when processing extremely large phone panoramas.
 4. **Physical Browser Testing**: Automated unit tests use mocked environments and cannot certify real browser EXIF rendering; real physical testing remains required.
+
+---
+
+## 8. Part 2 — Image Compressor Implementation & Architectural Decisions
+
+The Image Compressor (`src/components/tools/ImageTools.tsx` and `src/lib/image/compressImage.ts`) builds directly on top of the shared image helpers (`decodeImage`, `correctImageOrientation`, `canvasToBlob`, `downloadBlob`).
+
+### A. Supported Formats & Transparency Decisions
+1. **Input Formats**: Accepts JPEG, PNG, and WebP (as well as AVIF/BMP via `decodeImage`).
+2. **Output Formats**: Selectable among WebP (`image/webp`), JPEG (`image/jpeg`), and PNG (`image/png`).
+3. **Transparency Handling**:
+   - **PNG and WebP**: Alpha channel transparency is preserved natively.
+   - **JPEG**: Because JPEG does not support transparency, `canvasToBlob` automatically flattens transparency against an opaque white background (`#ffffff`). The UI displays an explicit informative note alerting users to this behavior.
+4. **Lossless PNG Optimizer & Adaptive Filtering**:
+   - Rather than relying solely on basic browser `canvas.toBlob("image/png")` which provides no byte reduction and ignores quality parameters, a dedicated lossless PNG encoder and optimizer is integrated (`src/lib/image/pngOptimizer.ts`).
+   - **Color Type Reduction**: Analyzes alpha channels via `ctx.getImageData()`. Images that are 100% opaque (`alpha === 255`) are losslessly encoded as 24-bit RGB (PNG Color Type 2), shedding 25% of uncompressed raw pixel data.
+   - **Transparency Optimization**: Images containing transparency retain 32-bit RGBA (PNG Color Type 6). Fully transparent pixels (`alpha === 0`) have their RGB channels zeroed to `(0, 0, 0)`, significantly enhancing Deflate run-length matching without altering rendered visual output.
+   - **Adaptive Scanline Filtering**: Evaluates standard PNG scanline predictors (None, Sub, Up, Average, Paeth) across three user-selectable optimization levels: `fast`, `default`, and `maximum`.
+   - **Standard Deflate**: Employs Web standard `CompressionStream("deflate")` with RFC 1950 zlib wrapping and standard ISO 3309 CRC-32 checksums.
+   - **Size Guard**: Automatically compares output against native `canvas.toBlob` and selects whichever is smaller.
+   - **Transparent UI Reporting**: When lossless PNG optimization yields no size reduction or conversion from lossy sources increases byte size, the UI transparently reports the exact difference with the note `(Lossless PNG preserves 100% pixel data)`.
+
+### B. Per-Image Batch Settings & Fault Isolation
+1. **Per-Image Independent Controls**: Each file card in a batch provides independent output format selection and quality/optimization controls. Individual settings can be adjusted and recompressed without overwriting other images.
+2. **Batch Defaults & Synchronization**: A top-level Batch Defaults panel allows users to configure global defaults and click "Apply to all images" to synchronize settings across all files simultaneously.
+3. **Fault Isolation**: Multiple files are processed in `compressBatch()`, with each operation protected by per-file error isolation. Corrupted files produce localized error cards while valid files continue compression and archive bundling.
+4. **Duplicate Filename Disambiguation**: Numbering follows the standard operating system convention: `photo-compressed.ext`, `photo-compressed (2).ext`, `photo-compressed (3).ext`. Different file extensions are preserved without artificial suffix collisions.
+
+### C. Visual Comparison & Memory Lifecycle
+1. **Side-by-Side Comparison**: Each compressed item renders original and compressed thumbnails with dimension displays, byte size metrics, and percentage reduction (`calculateSavings`).
+2. **Object URL Management**: All preview object URLs created with `URL.createObjectURL` are tracked in component refs and cleanly revoked via `URL.revokeObjectURL` upon file changes, recompression, or unmount.
+
+### D. ZIP Archiving
+1. **Bundling**: Uses project dependency `jszip` to bundle all successfully compressed items into a single ZIP archive (`compressed-images.zip`).
+2. **Filename Consistency**: Archive entry names strictly match individually downloaded file names, with unique numbering preventing any file overwrites inside the archive.
+
+### E. Verification & Test Metrics
+- **Automated Unit Tests**:
+  - `src/lib/image/__tests__/pngOptimizer.test.ts`: 10 unit tests (CRC-32, Color Type 2/6, adaptive filtering, CompressionStream fallback, canvas error handling).
+  - `src/lib/image/__tests__/compressImage.test.ts`: 23 unit tests (savings calculation, duplicate numbering, mixed format handling, per-item batch execution, fault isolation, ZIP creation).
+  - `src/lib/image/__tests__/image-helpers.test.ts`: 67 unit tests.
+- **Repository Vitest Suite**: **150 passing tests across 12 test files** (`pnpm test`).
+- **Real Browser Verification (CDP)**: Verified live on Next.js production build (`next start`) with real images and downloaded file inspections:
+  - Opaque PNG output confirmed as 24-bit RGB (Color Type 2).
+  - Transparent PNG output confirmed as 32-bit RGBA (Color Type 6) with intact transparency.
+  - Size increase handling verified with informative note.
+  - Duplicate naming confirmed as `photo-compressed.png`, `photo-compressed (2).png`, `photo-compressed (3).png`.
+  - Mixed per-image settings and individual recompression verified.
+  - Individual downloaded files matched ZIP archive entries 1:1.
+  - ZIP downloaded, extracted with JSZip, and verified with valid file headers.
+  - Corrupt file isolation verified with localized error badge and valid-only ZIP download.
+  - Zero browser console errors / uncaught exceptions.
